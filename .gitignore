@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+session-cleanup-reports/
+session-cleanup-backups/
+reports/
+backups/
+*.jsonl.bak*
