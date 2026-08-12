@@ -856,6 +856,9 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
         if replaced and original_backup.exists() and sha256_file(original_backup) == manifest.get("original_sha256"):
             try:
                 copy_file_fsync(original_backup, source)
+                os.chmod(source, source_mode)
+                if sha256_file(source) != manifest["original_sha256"]:
+                    raise ValueError("rollback hash does not match original backup")
             except Exception as rollback_error:  # pragma: no cover - disk/permission dependent
                 restore_error = rollback_error
         manifest["status"] = "failed"
