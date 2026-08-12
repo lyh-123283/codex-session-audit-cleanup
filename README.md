@@ -9,6 +9,39 @@ This tool changes disk history only. It does not shrink an already-loaded
 runtime context, and it does not modify the active conversation, the session
 index, SQLite databases, or writer locks.
 
+## Download and Install
+
+This repository is public and contains a self-contained Codex skill. No Python
+package installation is required. The simplest installation is to use the
+standard Codex GitHub skill installer:
+
+~~~powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+python "$codexHome\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
+  --repo lyh-123283/codex-session-audit-cleanup `
+  --path . `
+  --name codex-session-audit-cleanup
+~~~
+
+The installer copies the skill into
+<code>$codexHome\skills\codex-session-audit-cleanup</code>. Alternatively,
+download or clone this public repository and place the repository directory
+under <code>$codexHome\skills</code>. Restart or refresh Codex skill discovery
+after installation.
+
+## Use in Codex
+
+After installation, call the skill by name and specify one conversation. It
+will show the cleanup plan first and wait for confirmation before changing the
+file:
+
+~~~text
+Use $codex-session-audit-cleanup to inspect the conversation "<conversation-name>".
+Show the cleanup plan first; do not modify anything until I confirm the exact plan ID.
+~~~
+
+The Python commands below are optional for direct CLI use.
+
 ## What It Solves
 
 - An old Codex conversation is too large because of early tool-output image
@@ -31,9 +64,9 @@ The default policy is a conservative hybrid strategy:
   fields.
 - Only consider old tool-output records for transformation:
   - replace real <code>data:image...</code> image caches with a marker while
-    retaining the surrounding output structure;
-  - for still-large old outputs, retain a bounded prefix and suffix with a
-    truncation marker in the middle.
+    retaining the surrounding record structure;
+  - for still-large old outputs, replace the output payload with a text preview
+    containing a bounded prefix, suffix, and truncation marker in the middle.
 - Never delete complete records, delete by age alone, summarize messages,
   remove visible messages, or clear images embedded in user messages.
 
@@ -59,10 +92,13 @@ The <code>audit</code> command rereads both files and runs four checks:
 4. <code>integrity</code>: record count, session ID, tool call/result ID
    sequences, and old tool-output image constraints remain valid.
 
-These checks are four stages of one deterministic audit command, not four
-separate processes. After the command passes, the skill still presents every
-change and its risk to the user and requires an exact <code>plan_id</code>
-confirmation.
+Each stage reads fresh source/candidate snapshots and records an input digest
+and result digest. The <code>apply</code> command runs the same four stage
+functions again and rejects the plan if the stored audit differs from that
+fresh audit. This is a multi-stage, repeatable review inside one command, not
+four separate processes. After the command passes, the skill still presents
+every change and its risk to the user and requires an exact
+<code>plan_id</code> confirmation.
 
 ## Usage
 
@@ -96,7 +132,8 @@ The command writes:
   change list;
 - <code>candidate-&lt;plan-id&gt;.jsonl</code>: a candidate that has not replaced
   the source;
-- <code>audit-&lt;plan-id&gt;.json</code>: the later audit result.
+- <code>audit-&lt;plan-id&gt;.json</code>: the path reserved for the later audit
+  result; it is written by the <code>audit</code> command.
 
 Review the printed <code>plan_id</code>, changed lines, call IDs, original and
 candidate sizes, expected savings, image count, truncation count, and
@@ -109,7 +146,7 @@ python scripts/session_cleanup.py plan "<target>" --report-dir ".\session-cleanu
 ~~~
 
 All values must be positive, and the prefix plus suffix must fit within the
-maximum output size.
+maximum output size. The defaults are deliberately conservative.
 
 ### 3. Audit the Plan
 
@@ -141,8 +178,8 @@ Each successful apply creates a batch grouped by session ID and batch ID. Each
 batch contains:
 
 - <code>original.jsonl</code>: the original session file;
-- <code>manifest.json</code>: status, original path, plan and audit IDs, size,
-  and hashes.
+- <code>manifest.json</code>: status, original path, plan and audit IDs,
+  original size, and original/final hashes.
 
 ### List Backups
 
@@ -151,8 +188,10 @@ python scripts/session_cleanup.py backups list --backup-root ".\session-cleanup-
 ~~~
 
 Entries are reported as <code>success</code>, <code>failed</code>, or
-<code>unknown</code>. Incomplete, corrupted, or unverifiable backups are
-retained and are not automatic prune candidates.
+<code>unknown</code>, with a separate integrity value of
+<code>valid</code>, <code>invalid</code>, or <code>not_checked</code>.
+Incomplete, corrupted, or unverifiable backups are retained and are not
+automatic prune candidates.
 
 ### Preview and Remove Unused Backups
 
@@ -173,7 +212,9 @@ python scripts/session_cleanup.py backups prune --backup-root ".\session-cleanup
 The <code>preview_id</code> is bound to the complete backup set at preview
 time. If the set changes, confirmation fails and a new preview is required.
 Failed, unknown, and integrity-failed backups are never automatic deletion
-targets. <code>--keep</code> must be at least <code>1</code>.
+targets. On confirmation, candidates are rechecked and atomically moved into a
+temporary quarantine before recursive deletion. <code>--keep</code> must be at
+least <code>1</code>.
 
 ### Restore a Backup
 
@@ -182,9 +223,10 @@ python scripts/session_cleanup.py restore "<backup-directory>" --confirm "<backu
 ~~~
 
 Restore can write only to the original source path recorded in the manifest;
-it cannot target a different conversation. SHA-256 and JSONL parseability are
-checked before and after restore, and a writer lock causes the operation to
-fail.
+it cannot target a different conversation. The backup is checked before
+restore, the target is backed up temporarily, and SHA-256 and JSONL
+parseability are checked after restore. A failed post-restore check attempts
+to roll back the target. A writer lock causes the operation to fail.
 
 ## Safety Boundaries and Limitations
 
@@ -197,6 +239,8 @@ fail.
   reader observes the disk change.
 - Writer-lock detection cannot eliminate every check-to-write concurrency
   window; close the target conversation before applying a plan.
+- Restore checks the target lock before the operation, but cannot prevent an
+  external writer from appearing after that check.
 - Cross-platform Python cannot guarantee persistence across every power-loss
   scenario, so the original backup is always created and hash-verified.
 

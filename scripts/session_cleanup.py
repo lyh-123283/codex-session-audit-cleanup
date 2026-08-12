@@ -25,6 +25,8 @@ DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_PREFIX_BYTES = 8 * 1024
 DEFAULT_SUFFIX_BYTES = 4 * 1024
 PLAN_VERSION = 1
+AUDIT_STAGE_NAMES = ("schema", "policy", "deterministic_transform", "integrity")
+BACKUP_INTERNAL_DIRS = {".prune-previews", ".prune-quarantine"}
 RESERVED_NAMES = {
     "session_index.jsonl",
     "state_5.sqlite",
@@ -54,6 +56,11 @@ def self_digest(value: dict[str, Any], field: str) -> str:
     return sha256_bytes(encoded)
 
 
+def value_digest(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return sha256_bytes(encoded)
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
@@ -62,6 +69,11 @@ def write_json(path: Path, value: Any) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     fsync_directory(path.parent)
+
+
+def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    manifest["manifest_digest"] = self_digest(manifest, "manifest_digest")
+    write_json(path, manifest)
 
 
 def fsync_directory(path: Path) -> None:
@@ -119,7 +131,7 @@ def is_compaction(record: dict[str, Any]) -> bool:
 
 def is_visible_message(record: dict[str, Any]) -> bool:
     kind = payload_type(record)
-    return (kind == "message" and payload_role(record) in {"user", "assistant"}) or kind in VISIBLE_MESSAGE_TYPES
+    return payload_role(record) in {"user", "assistant"} or kind in VISIBLE_MESSAGE_TYPES
 
 
 def get_call_id(record: dict[str, Any]) -> str | None:
@@ -336,8 +348,8 @@ def validate_cleanup_options(
         raise ValueError("recent_records must be at least 1")
     if max_output_bytes < 1024:
         raise ValueError("max_output_bytes must be at least 1024")
-    if prefix_bytes < 0 or suffix_bytes < 0:
-        raise ValueError("prefix_bytes and suffix_bytes must be non-negative")
+    if prefix_bytes < 1 or suffix_bytes < 1:
+        raise ValueError("prefix_bytes and suffix_bytes must be at least 1")
     if prefix_bytes + suffix_bytes >= max_output_bytes:
         raise ValueError("prefix_bytes plus suffix_bytes must be less than max_output_bytes")
 
@@ -356,7 +368,7 @@ def transform_lines(
     truncated_outputs = 0
     bytes_saved = 0
     for line_number, (record, raw_line) in enumerate(zip(records, raw_lines), start=1):
-        if record.get("__invalid__") or line_number >= protected_from:
+        if record.get("__invalid__") or line_number >= protected_from or is_visible_message(record):
             candidate_lines.append(raw_line)
             continue
         kind = payload_type(record)
@@ -577,48 +589,180 @@ def compare_sequences(source_records: list[dict[str, Any]], candidate_records: l
     return errors
 
 
-def audit_plan(plan_path: Path) -> dict[str, Any]:
-    plan_path = plan_path.expanduser().resolve()
-    plan = read_json(plan_path)
-    source = validate_session_path(Path(plan["source"]["path"]))
-    candidate = Path(plan["candidate_path"])
-    errors: list[str] = []
-    stage_results: list[dict[str, Any]] = []
-    if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
-        errors.append("plan digest changed")
-    if plan.get("status") == "blocked":
-        errors.append("plan is blocked")
-    if not source.exists():
-        errors.append("source file is missing")
-    if not candidate.exists():
-        errors.append("candidate file is missing")
-    source_records: list[dict[str, Any]] = []
-    candidate_records: list[dict[str, Any]] = []
-    source_lines: list[bytes] = []
-    candidate_lines: list[bytes] = []
-    schema_errors: list[str] = []
-    if source.exists():
-        source_records, source_lines, source_errors = parse_jsonl(source)
-        schema_errors.extend(f"source line {item['line']}: {item['error']}" for item in source_errors)
-    if candidate.exists():
-        candidate_records, candidate_lines, candidate_errors = parse_jsonl(candidate)
-        schema_errors.extend(f"candidate line {item['line']}: {item['error']}" for item in candidate_errors)
-    errors.extend(schema_errors)
-    stage_results.append(
-        {
-            "name": "schema",
-            "status": "pass" if source_records and candidate_records and not schema_errors else "fail",
-            "checks": ["source and candidate are non-empty UTF-8 JSONL objects"],
-            "errors": schema_errors,
+def audit_file_snapshot(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "is_file": False,
+            "sha256": None,
+            "size": None,
+            "records": [],
+            "lines": [],
+            "errors": [],
         }
+    if not resolved.is_file():
+        return {
+            "path": str(resolved),
+            "exists": True,
+            "is_file": False,
+            "sha256": None,
+            "size": None,
+            "records": [],
+            "lines": [],
+            "errors": [{"line": 0, "error": "not_a_regular_file"}],
+        }
+    try:
+        records, lines, errors = parse_jsonl(resolved)
+        return {
+            "path": str(resolved),
+            "exists": True,
+            "is_file": True,
+            "sha256": sha256_file(resolved),
+            "size": resolved.stat().st_size,
+            "records": records,
+            "lines": lines,
+            "errors": errors,
+        }
+    except OSError as exc:
+        return {
+            "path": str(resolved),
+            "exists": True,
+            "is_file": True,
+            "sha256": None,
+            "size": None,
+            "records": [],
+            "lines": [],
+            "errors": [{"line": 0, "error": type(exc).__name__, "detail": str(exc)}],
+        }
+
+
+def audit_snapshot_input(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": snapshot["path"],
+        "exists": snapshot["exists"],
+        "is_file": snapshot["is_file"],
+        "sha256": snapshot["sha256"],
+        "size": snapshot["size"],
+        "record_count": len(snapshot["records"]),
+        "line_sha256": [sha256_bytes(line) for line in snapshot["lines"]],
+        "errors": snapshot["errors"],
+    }
+
+
+def make_audit_stage(
+    name: str,
+    status: str,
+    checks: list[str],
+    errors: list[str],
+    input_data: dict[str, Any],
+    observations: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stage: dict[str, Any] = {
+        "name": name,
+        "status": status,
+        "checks": checks,
+        "errors": errors,
+        "input_digest": value_digest(input_data),
+    }
+    if observations is not None:
+        stage["observations"] = observations
+    stage["result_digest"] = self_digest(stage, "result_digest")
+    return stage
+
+
+def validate_audit_stages(audit: dict[str, Any]) -> list[str]:
+    stages = audit.get("stages")
+    if not isinstance(stages, list):
+        return ["audit stages are missing"]
+    names = [stage.get("name") if isinstance(stage, dict) else None for stage in stages]
+    if names != list(AUDIT_STAGE_NAMES):
+        return ["audit stages are missing, duplicated, or out of order"]
+    errors: list[str] = []
+    for stage in stages:
+        if not isinstance(stage, dict):
+            errors.append("audit stage is not an object")
+            continue
+        if not isinstance(stage.get("input_digest"), str):
+            errors.append(f"{stage['name']} stage input digest is missing")
+        if stage.get("status") != "pass":
+            errors.append(f"{stage['name']} stage did not pass")
+        if stage.get("result_digest") != self_digest(stage, "result_digest"):
+            errors.append(f"{stage['name']} stage result digest changed")
+    return errors
+
+
+def audit_matches_current_files(plan: dict[str, Any], audit: dict[str, Any]) -> list[str]:
+    source = validate_session_path(Path(plan["source"]["path"]))
+    candidate = Path(plan["candidate_path"]).expanduser().resolve()
+    expected_stages = build_audit_stages(source, candidate, plan)
+    actual_stages = audit.get("stages")
+    if not isinstance(actual_stages, list):
+        return ["audit stages are missing"]
+    if len(actual_stages) != len(expected_stages):
+        return ["audit stage count does not match a fresh audit"]
+    errors: list[str] = []
+    for expected, actual in zip(expected_stages, actual_stages):
+        if actual != expected:
+            errors.append(f"{expected['name']} stage does not match a fresh audit")
+    return errors
+
+
+def audit_schema_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    errors: list[str] = []
+    if not source_snapshot["exists"]:
+        errors.append("source file is missing")
+    elif not source_snapshot["is_file"]:
+        errors.append("source is not a regular file")
+    if not candidate_snapshot["exists"]:
+        errors.append("candidate file is missing")
+    elif not candidate_snapshot["is_file"]:
+        errors.append("candidate is not a regular file")
+    errors.extend(
+        f"source line {item['line']}: {item['error']}" for item in source_snapshot["errors"]
     )
-    if source.exists() and fingerprint(source)["sha256"] != plan["source"]["sha256"]:
-        errors.append("source SHA-256 changed since plan generation")
-    if candidate.exists() and fingerprint(candidate)["sha256"] != plan["candidate"]["sha256"]:
-        errors.append("candidate SHA-256 changed since plan generation")
-    if len(source_records) != len(candidate_records):
-        errors.append("record count changed")
-    changed_lines = {item["line"] for item in plan.get("transformation", {}).get("changed_lines", [])}
+    errors.extend(
+        f"candidate line {item['line']}: {item['error']}" for item in candidate_snapshot["errors"]
+    )
+    if source_snapshot["exists"] and not source_snapshot["records"]:
+        errors.append("source is empty")
+    if candidate_snapshot["exists"] and not candidate_snapshot["records"]:
+        errors.append("candidate is empty")
+    input_data = {
+        "plan_hashes": {
+            "source": plan.get("source", {}).get("sha256"),
+            "candidate": plan.get("candidate", {}).get("sha256"),
+        },
+        "source": audit_snapshot_input(source_snapshot),
+        "candidate": audit_snapshot_input(candidate_snapshot),
+    }
+    return make_audit_stage(
+        "schema",
+        "pass" if not errors else "fail",
+        ["source and candidate are non-empty UTF-8 JSONL objects"],
+        errors,
+        input_data,
+        {
+            "source_records": len(source_snapshot["records"]),
+            "candidate_records": len(candidate_snapshot["records"]),
+        },
+    )
+
+
+def audit_policy_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    source_records = source_snapshot["records"]
+    candidate_records = candidate_snapshot["records"]
+    source_lines = source_snapshot["lines"]
+    candidate_lines = candidate_snapshot["lines"]
+    errors: list[str] = []
+    changed_lines = {
+        item["line"] for item in plan.get("transformation", {}).get("changed_lines", [])
+    }
     protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
     for line_number, (source_record, candidate_record, source_line, candidate_line) in enumerate(
         zip(source_records, candidate_records, source_lines, candidate_lines), start=1
@@ -635,57 +779,90 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
             errors.append(f"tool call record changed at line {line_number}")
         if line_number in changed_lines and payload_type(source_record) not in TOOL_OUTPUT_TYPES:
             errors.append(f"non-tool-output record selected at line {line_number}")
-    policy_errors = [error for error in errors if "protected" in error or "unexpected byte" in error or "non-tool-output" in error or "compaction" in error or "visible message" in error]
-    stage_results.append(
-        {
-            "name": "policy",
-            "status": "pass" if not policy_errors else "fail",
-            "checks": [
-                "only declared old tool-output lines changed",
-                "protected records and visible messages are byte-for-byte unchanged",
-                "recent boundary is intact",
-            ],
-            "errors": policy_errors,
-        }
+    input_data = {
+        "source": audit_snapshot_input(source_snapshot),
+        "candidate": audit_snapshot_input(candidate_snapshot),
+        "changed_lines": sorted(changed_lines),
+        "protected_from": protected_from,
+    }
+    return make_audit_stage(
+        "policy",
+        "pass" if not errors else "fail",
+        [
+            "only declared old tool-output lines changed",
+            "protected records and visible messages are byte-for-byte unchanged",
+            "recent boundary is intact",
+        ],
+        errors,
+        input_data,
+        {"changed_lines_checked": sorted(changed_lines)},
     )
+
+
+def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    source_records = source_snapshot["records"]
+    candidate_lines = candidate_snapshot["lines"]
+    source_lines = source_snapshot["lines"]
+    options = plan.get("transformation", {})
+    protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
+    errors: list[str] = []
+    try:
+        max_output_bytes = int(options["max_output_bytes"])
+        prefix_bytes = int(options["prefix_bytes"])
+        suffix_bytes = int(options["suffix_bytes"])
+        validate_cleanup_options(DEFAULT_RECENT_RECORDS, max_output_bytes, prefix_bytes, suffix_bytes)
+        expected = transform_lines(
+            source_records,
+            source_lines,
+            protected_from,
+            max_output_bytes,
+            prefix_bytes,
+            suffix_bytes,
+        )
+        if expected["candidate_lines"] != candidate_lines:
+            errors.append("candidate does not match deterministic transform")
+        if expected["changed_lines"] != options.get("changed_lines", []):
+            errors.append("plan transformation metadata does not match deterministic transform")
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"invalid transformation options: {exc}")
+    input_data = {
+        "source": audit_snapshot_input(source_snapshot),
+        "candidate": audit_snapshot_input(candidate_snapshot),
+        "protected_from": protected_from,
+        "transformation": options,
+    }
+    return make_audit_stage(
+        "deterministic_transform",
+        "pass" if not errors else "fail",
+        ["candidate is reproduced exactly from source and declared parameters"],
+        errors,
+        input_data,
+        {"candidate_lines": len(candidate_lines)},
+    )
+
+
+def audit_integrity_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    source_records = source_snapshot["records"]
+    candidate_records = candidate_snapshot["records"]
+    errors: list[str] = []
+    if source_snapshot["sha256"] != plan.get("source", {}).get("sha256"):
+        errors.append("source SHA-256 changed since plan generation")
+    if candidate_snapshot["sha256"] != plan.get("candidate", {}).get("sha256"):
+        errors.append("candidate SHA-256 changed since plan generation")
+    if len(source_records) != len(candidate_records):
+        errors.append("record count changed")
     errors.extend(compare_sequences(source_records, candidate_records))
-    deterministic_errors: list[str] = []
-    if source_records and candidate_records:
-        options = plan.get("transformation", {})
-        try:
-            max_output_bytes = int(options["max_output_bytes"])
-            prefix_bytes = int(options["prefix_bytes"])
-            suffix_bytes = int(options["suffix_bytes"])
-            validate_cleanup_options(DEFAULT_RECENT_RECORDS, max_output_bytes, prefix_bytes, suffix_bytes)
-            expected = transform_lines(
-                source_records,
-                source_lines,
-                protected_from,
-                max_output_bytes,
-                prefix_bytes,
-                suffix_bytes,
-            )
-            if expected["candidate_lines"] != candidate_lines:
-                deterministic_errors.append("candidate does not match deterministic transform")
-            if expected["changed_lines"] != plan.get("transformation", {}).get("changed_lines", []):
-                deterministic_errors.append("plan transformation metadata does not match deterministic transform")
-        except (KeyError, TypeError, ValueError) as exc:
-            deterministic_errors.append(f"invalid transformation options: {exc}")
-    errors.extend(deterministic_errors)
-    stage_results.append(
-        {
-            "name": "deterministic_transform",
-            "status": "pass" if not deterministic_errors else "fail",
-            "checks": ["candidate is reproduced exactly from source and declared parameters"],
-            "errors": deterministic_errors,
-        }
-    )
     source_stats = collect_stats(source, source_records, [])
     candidate_stats = collect_stats(candidate, candidate_records, [])
     if source_stats["session_id"] != candidate_stats["session_id"]:
         errors.append("session ID changed")
     if source_stats["visible_message_lines"] != candidate_stats["visible_message_lines"]:
         errors.append("visible message line sequence changed")
+    protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
     old_candidate_images = 0
     for line_number, record in enumerate(candidate_records, start=1):
         payload = record.get("payload")
@@ -694,31 +871,58 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
             old_candidate_images += count_image_nodes(output)
     if old_candidate_images:
         errors.append("old tool output still contains embedded image payloads")
-    integrity_errors = [
-        error
-        for error in errors
-        if error in {"record count changed", "session ID changed"}
-        or "SHA-256" in error
-        or "sequence changed" in error
-        or "parse" in error
-        or "image payloads" in error
-        or "deterministic" in error
-    ]
-    stage_results.append(
+    input_data = {
+        "source": audit_snapshot_input(source_snapshot),
+        "candidate": audit_snapshot_input(candidate_snapshot),
+        "protected_from": protected_from,
+        "expected_source_sha256": plan.get("source", {}).get("sha256"),
+        "expected_candidate_sha256": plan.get("candidate", {}).get("sha256"),
+    }
+    return make_audit_stage(
+        "integrity",
+        "pass" if not errors else "fail",
+        [
+            "source and candidate hashes are unchanged",
+            "record count, session ID, and tool ID sequences are stable",
+            "old tool-output image nodes are absent",
+        ],
+        errors,
+        input_data,
         {
-            "name": "integrity",
-            "status": "pass" if not integrity_errors else "fail",
-            "checks": [
-                "source and candidate hashes are unchanged",
-                "record count, session ID, and tool ID sequences are stable",
-                "old tool-output image nodes are absent",
-            ],
-            "errors": integrity_errors,
-        }
+            "source_records": len(source_records),
+            "candidate_records": len(candidate_records),
+            "old_candidate_images": old_candidate_images,
+        },
     )
-    status = "pass" if not errors else "fail"
+
+
+def build_audit_stages(source: Path, candidate: Path, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        audit_schema_stage(source, candidate, plan),
+        audit_policy_stage(source, candidate, plan),
+        audit_deterministic_stage(source, candidate, plan),
+        audit_integrity_stage(source, candidate, plan),
+    ]
+
+
+def audit_plan(plan_path: Path) -> dict[str, Any]:
+    plan_path = plan_path.expanduser().resolve()
+    plan = read_json(plan_path)
+    source = validate_session_path(Path(plan["source"]["path"]))
+    candidate = Path(plan["candidate_path"]).expanduser().resolve()
+    plan_errors: list[str] = []
+    if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
+        plan_errors.append("plan digest changed")
+    if plan.get("status") == "blocked":
+        plan_errors.append("plan is blocked")
+    stage_results = build_audit_stages(source, candidate, plan)
+    errors: list[str] = []
+    for error in [*plan_errors, *(error for stage in stage_results for error in stage["errors"])]:
+        if error not in errors:
+            errors.append(error)
+    status = "pass" if not errors and all(stage["status"] == "pass" for stage in stage_results) else "fail"
     audit = {
-        "audit_version": 1,
+        "audit_version": 2,
         "audit_id": uuid.uuid4().hex,
         "created_at": utc_now(),
         "plan_id": plan["plan_id"],
@@ -733,14 +937,13 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
             "candidate_unchanged": not any("candidate SHA-256" in error for error in errors),
             "jsonl_parseable": not any("line" in error and ("source" in error or "candidate" in error) for error in errors),
             "protected_records_unchanged": not any("protected" in error for error in errors),
-            "tool_sequences_unchanged": not any("tool call ID" in error or "tool output call ID" in error for error in errors),
+            "tool_sequences_unchanged": not any("sequence changed" in error for error in errors),
             "old_images_removed": not any("embedded image" in error for error in errors),
         },
         "errors": errors,
     }
     audit["audit_digest"] = self_digest(audit, "audit_digest")
-    audit_path = Path(plan["audit_path"])
-    write_json(audit_path, audit)
+    write_json(Path(plan["audit_path"]), audit)
     return audit
 
 
@@ -755,6 +958,29 @@ def ensure_inside(root: Path, child: Path) -> None:
 
 def default_backup_root() -> Path:
     return Path.home() / ".codex" / "session-cleanup-backups"
+
+
+def validate_backup_session_id(session_id: str) -> str:
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+        or ":" in session_id
+    ):
+        raise ValueError("session_id must be a single safe path segment")
+    return session_id
+
+
+def validate_preview_id(preview_id: str) -> str:
+    if (
+        not isinstance(preview_id, str)
+        or len(preview_id) != 32
+        or any(character not in "0123456789abcdef" for character in preview_id)
+    ):
+        raise ValueError("preview_id must be a generated 32-character hexadecimal ID")
+    return preview_id
 
 
 def validate_session_path(path: Path) -> Path:
@@ -779,8 +1005,14 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     audit = read_json(audit_path)
     if audit.get("audit_digest") != self_digest(audit, "audit_digest"):
         raise ValueError("audit digest changed after review")
+    stage_errors = validate_audit_stages(audit)
+    fresh_audit_errors = audit_matches_current_files(plan, audit)
     if audit.get("status") != "pass" or audit.get("plan_id") != plan.get("plan_id"):
         raise ValueError("independent audit did not pass for this plan")
+    if stage_errors:
+        raise ValueError("audit stage validation failed: " + "; ".join(stage_errors))
+    if fresh_audit_errors:
+        raise ValueError("audit no longer matches a fresh audit: " + "; ".join(fresh_audit_errors))
     if audit.get("plan_digest") != plan.get("plan_digest"):
         raise ValueError("audit is not bound to the current plan")
     if audit.get("plan_path") != str(plan_path):
@@ -798,6 +1030,7 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
         raise ValueError("writer lock detected: " + ", ".join(locks))
     backup_root = (backup_root or default_backup_root()).expanduser().resolve()
     session_id = plan.get("session_id") or source.stem
+    validate_backup_session_id(str(session_id))
     backup_id = f"{utc_now().replace(':', '').replace('-', '')}-{uuid.uuid4().hex[:8]}"
     backup_dir = backup_root / str(session_id) / backup_id
     ensure_inside(backup_root, backup_dir)
@@ -819,7 +1052,7 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     temp_path: Path | None = None
     replaced = False
     try:
-        write_json(manifest_path, manifest)
+        write_manifest(manifest_path, manifest)
         copy_file_fsync(source, original_backup)
         original_hash = sha256_file(original_backup)
         if original_hash != plan["source"]["sha256"]:
@@ -831,7 +1064,7 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
                 "original_bytes": original_backup.stat().st_size,
             }
         )
-        write_json(manifest_path, manifest)
+        write_manifest(manifest_path, manifest)
         with tempfile.NamedTemporaryFile(
             mode="wb", dir=source.parent, prefix=f".{source.name}.cleanup-", suffix=".tmp", delete=False
         ) as handle:
@@ -848,7 +1081,7 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
             raise ValueError("post-write hash does not match candidate")
         manifest["status"] = "success"
         manifest["final_sha256"] = sha256_file(source)
-        write_json(manifest_path, manifest)
+        write_manifest(manifest_path, manifest)
     except Exception as error:
         if temp_path and temp_path.exists():
             temp_path.unlink()
@@ -866,7 +1099,7 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
         if restore_error:
             manifest["rollback_error"] = str(restore_error)
         try:
-            write_json(manifest_path, manifest)
+            write_manifest(manifest_path, manifest)
         except OSError:
             pass
         if restore_error:
@@ -883,12 +1116,18 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
 
 def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[str, Any]]:
     backup_root = backup_root.expanduser().resolve()
+    if session_id is not None:
+        validate_backup_session_id(session_id)
     if not backup_root.exists():
         return []
-    roots = [backup_root / session_id] if session_id else [path for path in backup_root.iterdir() if path.is_dir()]
+    roots = (
+        [backup_root / session_id]
+        if session_id
+        else [path for path in backup_root.iterdir() if path.is_dir() and path.name not in BACKUP_INTERNAL_DIRS]
+    )
     result: list[dict[str, Any]] = []
     for session_root in roots:
-        if not session_root.is_dir():
+        if not session_root.is_dir() or session_root.name in BACKUP_INTERNAL_DIRS:
             continue
         for batch in session_root.iterdir():
             manifest_path = batch / "manifest.json"
@@ -900,6 +1139,7 @@ def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[
                         "path": str(batch.resolve()),
                         "session_id": session_root.name,
                         "status": "unknown",
+                        "integrity": "unknown",
                         "reason": "manifest.json is missing",
                     }
                 )
@@ -907,9 +1147,24 @@ def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[
             try:
                 manifest = read_json(manifest_path)
                 manifest["path"] = str(batch.resolve())
+                if manifest.get("status") == "success":
+                    is_valid, reason = backup_integrity(manifest, backup_root, session_root.name)
+                    manifest["integrity"] = "valid" if is_valid else "invalid"
+                    if not is_valid:
+                        manifest["integrity_error"] = reason
+                else:
+                    manifest["integrity"] = "not_checked"
                 result.append(manifest)
             except (OSError, ValueError, json.JSONDecodeError):
-                result.append({"path": str(batch.resolve()), "status": "unknown"})
+                result.append(
+                    {
+                        "path": str(batch.resolve()),
+                        "session_id": session_root.name,
+                        "status": "unknown",
+                        "integrity": "unknown",
+                        "reason": "manifest.json is unreadable",
+                    }
+                )
     return sorted(result, key=lambda item: str(item.get("created_at", "")), reverse=True)
 
 
@@ -927,6 +1182,8 @@ def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) 
         manifest = read_json(path / "manifest.json")
         if manifest.get("backup_id") != entry.get("backup_id"):
             return False, "manifest identity changed"
+        if manifest.get("manifest_digest") != self_digest(manifest, "manifest_digest"):
+            return False, "manifest digest mismatch"
         source_path = manifest.get("source_path")
         if not isinstance(source_path, str):
             return False, "manifest source path is missing"
@@ -985,11 +1242,13 @@ def prune_snapshot(entries: list[dict[str, Any]], backup_root: Path, session_id:
 def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm: str | bool | None = None) -> dict[str, Any]:
     if keep < 1:
         raise ValueError("keep must be at least 1")
+    validate_backup_session_id(session_id)
     backup_root = backup_root.expanduser().resolve()
     entries = list_backups(backup_root, session_id)
     if confirm is True:
         raise ValueError("prune confirmation must be the preview_id returned by a prior preview")
     if isinstance(confirm, str):
+        validate_preview_id(confirm)
         preview_path = backup_root / ".prune-previews" / f"{confirm}.json"
         if not preview_path.is_file():
             raise ValueError("unknown or expired prune preview_id")
@@ -1004,8 +1263,49 @@ def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm:
         paths = [Path(path).resolve() for path in preview["candidate_paths"]]
         for path in paths:
             ensure_inside(backup_root, path)
-        for path in paths:
-            shutil.rmtree(path)
+            if not path.is_dir():
+                raise ValueError(f"backup candidate is no longer a directory: {path}")
+            current_entry = next((entry for entry in entries if Path(entry.get("path", "")).resolve() == path), None)
+            if current_entry is None:
+                raise ValueError(f"backup candidate disappeared: {path}")
+            is_valid, reason = backup_integrity(current_entry, backup_root, session_id)
+            if not is_valid:
+                raise ValueError(f"backup candidate failed final integrity check: {path}: {reason}")
+        quarantine_root = backup_root / ".prune-quarantine" / confirm
+        ensure_inside(backup_root, quarantine_root)
+        quarantine_root.mkdir(parents=True, exist_ok=False)
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for path in paths:
+                quarantine_path = quarantine_root / path.name
+                os.replace(path, quarantine_path)
+                moved.append((path, quarantine_path))
+            fsync_directory(quarantine_root)
+        except Exception as error:
+            rollback_errors: list[str] = []
+            for original_path, quarantine_path in reversed(moved):
+                try:
+                    os.replace(quarantine_path, original_path)
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            if not rollback_errors:
+                try:
+                    quarantine_root.rmdir()
+                except OSError:
+                    pass
+            detail = f"prune move failed: {error}"
+            if rollback_errors:
+                detail += "; quarantine rollback failed: " + "; ".join(rollback_errors)
+            raise RuntimeError(detail) from error
+        try:
+            for path in quarantine_root.iterdir():
+                shutil.rmtree(path)
+            quarantine_root.rmdir()
+            fsync_directory(quarantine_root.parent)
+        except Exception as error:
+            raise RuntimeError(
+                f"prune deletion failed; candidates remain in quarantine: {quarantine_root}: {error}"
+            ) from error
         return {
             "status": "success",
             "preview_id": confirm,
@@ -1039,6 +1339,8 @@ def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm:
 def restore_backup(backup_dir: Path, confirmation: str, target: Path | None = None) -> dict[str, Any]:
     backup_dir = backup_dir.expanduser().resolve()
     manifest = read_json(backup_dir / "manifest.json")
+    if manifest.get("manifest_digest") != self_digest(manifest, "manifest_digest"):
+        raise ValueError("manifest digest mismatch")
     if confirmation != manifest.get("backup_id"):
         raise ValueError("confirmation must exactly equal backup_id")
     if manifest.get("status") != "success":
@@ -1055,24 +1357,84 @@ def restore_backup(backup_dir: Path, confirmation: str, target: Path | None = No
     validate_session_path(destination)
     if find_locks(destination):
         raise ValueError("writer lock detected for restore target")
-    with tempfile.NamedTemporaryFile(mode="wb", dir=destination.parent, prefix=f".{destination.name}.restore-", delete=False) as handle:
-        temp_path = Path(handle.name)
-        with original.open("rb") as original_handle:
-            shutil.copyfileobj(original_handle, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
+    destination_existed = destination.exists()
+    destination_mode = destination.stat().st_mode if destination_existed else None
+    rollback_path: Path | None = None
+    rollback_sha256: str | None = None
+    temp_path: Path | None = None
+    replaced = False
     try:
+        if destination_existed:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=destination.parent,
+                prefix=f".{destination.name}.restore-rollback-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                rollback_path = Path(handle.name)
+                with destination.open("rb") as destination_handle:
+                    shutil.copyfileobj(destination_handle, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            rollback_sha256 = sha256_file(rollback_path)
+            if destination_mode is not None:
+                os.chmod(rollback_path, destination_mode)
+
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=f".{destination.name}.restore-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            with original.open("rb") as original_handle:
+                shutil.copyfileobj(original_handle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if destination_mode is not None:
+            os.chmod(temp_path, destination_mode)
+
         os.replace(temp_path, destination)
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path = None
+        replaced = True
+        fsync_directory(destination.parent)
+
+        if sha256_file(destination) != manifest["original_sha256"]:
+            raise ValueError("restored file hash mismatch")
+        restored_records, _, restored_errors = parse_jsonl(destination)
+        if not restored_records or restored_errors:
+            raise ValueError("restored file is not valid JSONL")
+        return {"status": "success", "target": str(destination), "sha256": manifest["original_sha256"]}
+    except Exception as error:
+        rollback_error: Exception | None = None
+        if replaced:
+            if rollback_path and rollback_path.exists():
+                try:
+                    os.replace(rollback_path, destination)
+                    rollback_path = None
+                    if destination_mode is not None:
+                        os.chmod(destination, destination_mode)
+                    fsync_directory(destination.parent)
+                    if rollback_sha256 is None or sha256_file(destination) != rollback_sha256:
+                        raise ValueError("rollback hash check failed")
+                except Exception as restore_error:
+                    rollback_error = restore_error
+            elif not destination_existed and destination.exists():
+                try:
+                    destination.unlink()
+                    fsync_directory(destination.parent)
+                except Exception as restore_error:
+                    rollback_error = restore_error
+        if rollback_error:
+            raise RuntimeError(f"restore validation failed and rollback failed: {error}; {rollback_error}") from error
         raise
-    if sha256_file(destination) != manifest["original_sha256"]:
-        raise ValueError("restored file hash mismatch")
-    restored_records, _, restored_errors = parse_jsonl(destination)
-    if not restored_records or restored_errors:
-        raise ValueError("restored file is not valid JSONL")
-    return {"status": "success", "target": str(destination), "sha256": manifest["original_sha256"]}
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+        if rollback_path and rollback_path.exists():
+            rollback_path.unlink()
 
 
 def resolve_target(target: str, codex_home: Path | None = None) -> Path:

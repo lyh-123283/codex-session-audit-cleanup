@@ -76,9 +76,10 @@ The default plan is deliberately conservative:
 
 - Only old `custom_tool_call_output` or `function_call_output` records.
 - Replace structured `input_image` nodes whose URL is a `data:image...` cache
-  with a text marker while retaining surrounding tool-output structure.
-- For an old tool output still over 64 KiB, keep a bounded prefix and suffix
-  with `[older tool output middle truncated]` between them.
+  with a text marker while retaining the surrounding record structure.
+- For an old tool output still over 64 KiB, replace its output payload with a
+  text preview containing a bounded prefix, suffix, and
+  `[older tool output middle truncated]` marker.
 - Never delete a complete record, delete by age alone, summarize messages,
   remove old user/assistant content, or clear user-message images by default.
 
@@ -86,14 +87,15 @@ If the plan would alter anything outside these rules, mark it blocked and do
 not invent a workaround. A future policy can be added only as an explicit,
 separately reviewed strategy.
 
-### 3. Run independent audits
+### 3. Run multi-stage audits
 
 ```powershell
 python scripts/session_cleanup.py audit "<plan-json>"
 ```
 
-Treat the deterministic audit as a separate review, not as confirmation of the
-plan generator. It must verify:
+Treat the audit as a fresh review, not as confirmation of the plan generator.
+It runs four named stages. Each stage rereads the source/candidate snapshots,
+records an input digest and result digest, and must pass independently:
 
 - source and candidate hashes still match the plan;
 - both files parse line-by-line as UTF-8 JSONL objects;
@@ -102,6 +104,11 @@ plan generator. It must verify:
 - every changed line is an allowed old tool-output line;
 - the protected region is byte-for-byte unchanged;
 - old tool-output image nodes are gone and no unexpected image node was added.
+
+The `apply` command runs the same four stage functions again and compares their
+results with the stored audit. A missing, reordered, tampered, or stale stage
+invalidates the plan. The stages are repeatable checks in one command, not
+separate processes.
 
 Then perform a human-facing risk review of the printed `changed_lines` list:
 every line must have a clear reason, bounded impact, and expected savings. An
@@ -121,9 +128,9 @@ Show the user:
 - the fact that active context is unchanged;
 - any residual risk.
 
-Ask for explicit confirmation containing the plan ID. Silence, “looks good,”
-or an approval of an earlier version is insufficient unless the exact plan ID
-is supplied.
+Ask for explicit confirmation containing the plan ID. Silence, a vague
+approval, or an approval of an earlier version is insufficient unless the exact
+plan ID is supplied.
 
 ### 5. Apply only the reviewed plan
 
@@ -140,7 +147,9 @@ hash, and post-write status. Never silently retry against a changed source.
 
 ### 6. Manage and restore backups
 
-List backups without changing anything:
+List backups without changing anything. The output includes an integrity value
+for successful batches; only `integrity: valid` batches can become prune
+candidates:
 
 ```powershell
 python scripts/session_cleanup.py backups list `
