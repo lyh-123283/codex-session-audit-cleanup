@@ -56,8 +56,10 @@ The Python commands below are optional for direct CLI use.
 
 The default policy is a conservative hybrid strategy:
 
-- Preserve every record from the latest compaction boundary onward. If there
-  is no compaction boundary, preserve the recent tail fallback.
+- Preserve every record from the latest logical compaction boundary onward by
+  default. Use <code>--recent-compactions N</code> to preserve from the N most
+  recent logical compaction boundaries; if there is no compaction boundary,
+  preserve the recent tail fallback.
 - Preserve all visible user and assistant messages byte-for-byte.
 - Preserve <code>session_meta</code>, compaction records, events, reasoning,
   token counts, patches, tool calls, call IDs, unknown records, and unknown
@@ -144,6 +146,12 @@ Optional conservative parameters:
 ~~~powershell
 python scripts/session_cleanup.py plan "<target>" --report-dir ".\session-cleanup-reports" --recent-records 40 --max-output-bytes 65536 --prefix-bytes 8192 --suffix-bytes 8192
 ~~~
+
+To retain the latest two logical compaction boundaries, add
+<code>--recent-compactions 2</code>. Codex normally records one logical
+compaction as a <code>compacted</code> record followed by a
+<code>context_compacted</code> event; the plan records the selected boundary
+lines and the audit recomputes them.
 
 All values must be positive, and the prefix plus suffix must fit within the
 maximum output size. The defaults are deliberately conservative.

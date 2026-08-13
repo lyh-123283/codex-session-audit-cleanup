@@ -16,6 +16,7 @@ from session_cleanup import (  # noqa: E402
     audit_plan,
     build_plan,
     list_backups,
+    logical_compaction_boundaries,
     prune_backups,
     restore_backup,
     sha256_file,
@@ -103,6 +104,159 @@ def make_session(path):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_recent_compactions_preserves_from_second_latest_logical_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+
+            with source.open("w", encoding="utf-8", newline="\n") as handle:
+                write_record(handle, {"type": "session_meta", "payload": {"id": "session-1"}})
+                write_record(
+                    handle,
+                    {
+                        "type": "response_item",
+                        "payload": {"type": "custom_tool_call", "call_id": "old-call"},
+                    },
+                )
+                write_record(
+                    handle,
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "old-call",
+                            "output": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "data:image/png;base64:" + "A" * 512,
+                                }
+                            ],
+                        },
+                    },
+                )
+                write_record(handle, {"type": "compacted", "payload": {"window_number": 1}})
+                write_record(handle, {"type": "world_state", "payload": {"state": "one"}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+                write_record(
+                    handle,
+                    {
+                        "type": "response_item",
+                        "payload": {"type": "custom_tool_call", "call_id": "protected-call"},
+                    },
+                )
+                write_record(
+                    handle,
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "protected-call",
+                            "output": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "data:image/png;base64:" + "B" * 512,
+                                }
+                            ],
+                        },
+                    },
+                )
+                write_record(handle, {"type": "compacted", "payload": {"window_number": 2}})
+                write_record(handle, {"type": "world_state", "payload": {"state": "two"}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+
+            plan = build_plan(source, root / "reports", recent_compactions=2)
+
+            self.assertEqual(plan["protected_region"]["from_line"], 4)
+            self.assertEqual(plan["protected_region"]["logical_compactions"], 2)
+            candidate_lines = Path(plan["candidate_path"]).read_bytes().splitlines()
+            self.assertIn(b"[image cache cleared]", candidate_lines[2])
+            self.assertIn(b"data:image/png;base64", candidate_lines[7])
+
+    def test_recent_compactions_boundary_is_rechecked_by_audit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            with source.open("w", encoding="utf-8", newline="\n") as handle:
+                write_record(handle, {"type": "session_meta", "payload": {"id": "session-1"}})
+                write_record(handle, {"type": "compacted", "payload": {"window_number": 1}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+                write_record(handle, {"type": "compacted", "payload": {"window_number": 2}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+
+            plan = build_plan(source, root / "reports", recent_compactions=2)
+            audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(audit["status"], "pass")
+
+            plan["protected_region"]["selected_boundary_lines"] = [999]
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+
+            tampered_audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(tampered_audit["status"], "fail")
+            self.assertTrue(
+                any(
+                    "protected boundary metadata mismatch" in error
+                    for error in tampered_audit["errors"]
+                )
+            )
+
+    def test_context_only_compactions_are_counted_as_logical_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            with source.open("w", encoding="utf-8", newline="\n") as handle:
+                write_record(handle, {"type": "session_meta", "payload": {"id": "session-1"}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+
+            plan = build_plan(source, root / "reports", recent_compactions=2)
+
+            self.assertEqual(plan["protected_region"]["selected_boundary_lines"], [2, 3])
+            self.assertEqual(plan["protected_region"]["reason"], "latest_logical_compactions")
+
+    def test_mixed_compaction_records_pair_in_source_order(self):
+        records = [
+            {"type": "session_meta", "payload": {"id": "session-1"}},
+            {"type": "event_msg", "payload": {"type": "context_compacted"}},
+            {"type": "compacted", "payload": {"window_number": 1}},
+            {"type": "response_item", "payload": {"type": "context_compacted"}},
+            {"type": "compacted", "payload": {"window_number": 2}},
+            {"type": "event_msg", "payload": {"type": "context_compacted"}},
+        ]
+
+        self.assertEqual(logical_compaction_boundaries(records), [2, 3, 5])
+
+    def test_recent_compactions_uses_all_available_boundaries_when_requested_count_is_larger(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            with source.open("w", encoding="utf-8", newline="\n") as handle:
+                write_record(handle, {"type": "session_meta", "payload": {"id": "session-1"}})
+                write_record(handle, {"type": "compacted", "payload": {"window_number": 1}})
+                write_record(handle, {"type": "event_msg", "payload": {"type": "context_compacted"}})
+
+            plan = build_plan(source, root / "reports", recent_compactions=3)
+            region = plan["protected_region"]
+
+            self.assertEqual(region["from_line"], 2)
+            self.assertEqual(region["selected_boundary_lines"], [2])
+            self.assertEqual(region["logical_compactions"], 1)
+            self.assertEqual(region["requested_logical_compactions"], 3)
+            self.assertEqual(region["available_logical_compactions"], 1)
+            self.assertEqual(region["reason"], "available_logical_compactions")
+
+    def test_recent_compactions_rejects_non_positive_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "session.jsonl"
+            make_session(source)
+
+            with self.assertRaises(ValueError):
+                build_plan(source, Path(temp_dir) / "reports", recent_compactions=0)
+            with self.assertRaises(ValueError):
+                build_plan(source, Path(temp_dir) / "reports", recent_compactions=-1)
+
     def test_audit_stages_have_bound_digests_and_apply_requires_all_stages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

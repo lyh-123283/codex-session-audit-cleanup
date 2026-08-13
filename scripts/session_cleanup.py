@@ -21,10 +21,11 @@ TOOL_CALL_TYPES = {"custom_tool_call", "function_call"}
 TOOL_OUTPUT_TYPES = {"custom_tool_call_output", "function_call_output"}
 VISIBLE_MESSAGE_TYPES = {"user_message", "agent_message"}
 DEFAULT_RECENT_RECORDS = 1000
+DEFAULT_RECENT_COMPACTIONS = 1
 DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_PREFIX_BYTES = 8 * 1024
 DEFAULT_SUFFIX_BYTES = 4 * 1024
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 AUDIT_STAGE_NAMES = ("schema", "policy", "deterministic_transform", "integrity")
 BACKUP_INTERNAL_DIRS = {".prune-previews", ".prune-quarantine"}
 RESERVED_NAMES = {
@@ -127,6 +128,28 @@ def payload_role(record: dict[str, Any]) -> str:
 
 def is_compaction(record: dict[str, Any]) -> bool:
     return record.get("type") == "compacted" or payload_type(record) == "context_compacted"
+
+
+def logical_compaction_boundaries(records: list[dict[str, Any]]) -> list[int]:
+    """Return one start line per logical compaction event.
+
+    Codex normally writes a ``compacted`` record followed by a
+    ``context_compacted`` event for one compaction. The former starts the
+    logical boundary; the first later context marker consumes that pair. A
+    context marker without a pending compacted record starts its own boundary.
+    """
+    boundaries: list[int] = []
+    pending_compacted = False
+    for line_number, record in enumerate(records, start=1):
+        if record.get("type") == "compacted":
+            boundaries.append(line_number)
+            pending_compacted = True
+        elif payload_type(record) == "context_compacted":
+            if pending_compacted:
+                pending_compacted = False
+            else:
+                boundaries.append(line_number)
+    return boundaries
 
 
 def is_visible_message(record: dict[str, Any]) -> bool:
@@ -286,6 +309,7 @@ def collect_stats(path: Path, records: list[dict[str, Any]], errors: list[dict[s
             timestamps.append(timestamp)
     call_set = set(call_ids)
     output_set = set(output_ids)
+    logical_compaction_lines = logical_compaction_boundaries(records)
     return {
         "record_count": len(records),
         "invalid_record_count": len(errors),
@@ -297,6 +321,8 @@ def collect_stats(path: Path, records: list[dict[str, Any]], errors: list[dict[s
         "first_timestamp": timestamps[0] if timestamps else None,
         "last_timestamp": timestamps[-1] if timestamps else None,
         "compaction_lines": compaction_lines,
+        "logical_compaction_lines": logical_compaction_lines,
+        "logical_compaction_count": len(logical_compaction_lines),
         "visible_message_lines": visible_message_lines,
         "tool_call_count": len(call_ids),
         "tool_output_count": tool_output_count,
@@ -331,11 +357,90 @@ def find_locks(path: Path) -> list[str]:
     return sorted(set(locks))
 
 
-def recent_boundary(records: list[dict[str, Any]], recent_records: int) -> tuple[int, str]:
-    compactions = [line for line, record in enumerate(records, start=1) if is_compaction(record)]
+def recent_boundary(
+    records: list[dict[str, Any]],
+    recent_records: int,
+    recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
+) -> tuple[int, str]:
+    if recent_compactions < 1:
+        raise ValueError("recent_compactions must be at least 1")
+    compactions = logical_compaction_boundaries(records)
     if compactions:
-        return compactions[-1], "latest_compaction"
+        start = max(0, len(compactions) - recent_compactions)
+        if recent_compactions == 1:
+            reason = "latest_compaction"
+        elif len(compactions) < recent_compactions:
+            reason = "available_logical_compactions"
+        else:
+            reason = "latest_logical_compactions"
+        return compactions[start], reason
     return max(1, len(records) - recent_records + 1), "recent_tail_fallback"
+
+
+def boundary_metadata(
+    records: list[dict[str, Any]],
+    recent_records: int,
+    recent_compactions: int,
+) -> dict[str, Any]:
+    compaction_boundaries = logical_compaction_boundaries(records)
+    protected_from, protected_reason = recent_boundary(
+        records, recent_records, recent_compactions
+    )
+    selected_compaction_boundaries = compaction_boundaries[
+        max(0, len(compaction_boundaries) - recent_compactions) :
+    ]
+    return {
+        "from_line": protected_from,
+        "reason": protected_reason,
+        "includes_from_line": True,
+        "logical_compactions": len(selected_compaction_boundaries),
+        "requested_logical_compactions": recent_compactions,
+        "available_logical_compactions": len(compaction_boundaries),
+        "selected_boundary_lines": selected_compaction_boundaries,
+        "fallback_recent_records": recent_records,
+    }
+
+
+def plan_boundary_metadata(
+    records: list[dict[str, Any]], plan: dict[str, Any]
+) -> tuple[int, list[str], dict[str, Any]]:
+    region = plan.get("protected_region")
+    if not isinstance(region, dict):
+        return 1, ["protected region metadata is missing"], {}
+
+    if plan.get("plan_version") != PLAN_VERSION:
+        return 1, ["unsupported plan version; regenerate the plan"], {}
+    if "requested_logical_compactions" not in region:
+        return 1, ["protected boundary metadata is missing; regenerate the plan"], {}
+
+    errors: list[str] = []
+    try:
+        recent_compactions = int(region["requested_logical_compactions"])
+        recent_records = int(region.get("fallback_recent_records", DEFAULT_RECENT_RECORDS))
+        validate_cleanup_options(
+            recent_records,
+            DEFAULT_MAX_OUTPUT_BYTES,
+            DEFAULT_PREFIX_BYTES,
+            DEFAULT_SUFFIX_BYTES,
+            recent_compactions,
+        )
+        expected = boundary_metadata(records, recent_records, recent_compactions)
+    except (KeyError, TypeError, ValueError) as exc:
+        return 1, [f"invalid protected region metadata: {exc}"], {}
+
+    for field in (
+        "from_line",
+        "reason",
+        "includes_from_line",
+        "logical_compactions",
+        "requested_logical_compactions",
+        "available_logical_compactions",
+        "selected_boundary_lines",
+        "fallback_recent_records",
+    ):
+        if region.get(field) != expected[field]:
+            errors.append(f"protected boundary metadata mismatch: {field}")
+    return expected["from_line"], errors, expected
 
 
 def validate_cleanup_options(
@@ -343,9 +448,12 @@ def validate_cleanup_options(
     max_output_bytes: int,
     prefix_bytes: int,
     suffix_bytes: int,
+    recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
 ) -> None:
     if recent_records < 1:
         raise ValueError("recent_records must be at least 1")
+    if recent_compactions < 1:
+        raise ValueError("recent_compactions must be at least 1")
     if max_output_bytes < 1024:
         raise ValueError("max_output_bytes must be at least 1024")
     if prefix_bytes < 1 or suffix_bytes < 1:
@@ -492,11 +600,18 @@ def build_plan(
     report_dir: Path,
     *,
     recent_records: int = DEFAULT_RECENT_RECORDS,
+    recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
     prefix_bytes: int = DEFAULT_PREFIX_BYTES,
     suffix_bytes: int = DEFAULT_SUFFIX_BYTES,
 ) -> dict[str, Any]:
-    validate_cleanup_options(recent_records, max_output_bytes, prefix_bytes, suffix_bytes)
+    validate_cleanup_options(
+        recent_records,
+        max_output_bytes,
+        prefix_bytes,
+        suffix_bytes,
+        recent_compactions,
+    )
     source = validate_session_path(source)
     report_dir = report_dir.expanduser().resolve()
     records, raw_lines, errors = parse_jsonl(source)
@@ -504,7 +619,8 @@ def build_plan(
         errors.append({"line": 0, "error": "empty_session"})
     source_fingerprint = fingerprint(source)
     stats = collect_stats(source, records, errors)
-    protected_from, protected_reason = recent_boundary(records, recent_records)
+    protected_region = boundary_metadata(records, recent_records, recent_compactions)
+    protected_from = protected_region["from_line"]
     plan_id = uuid.uuid4().hex
     candidate = report_dir / f"candidate-{plan_id}.jsonl"
     transformation = write_candidate(
@@ -532,11 +648,9 @@ def build_plan(
         "source_stats": stats,
         "locks": find_locks(source),
         "protected_region": {
-            "from_line": protected_from,
-            "reason": protected_reason,
-            "includes_from_line": True,
+            **protected_region,
             "rules": [
-                "preserve all records from the latest compaction boundary",
+                "preserve all records from the selected logical compaction boundary",
                 "preserve all user and assistant visible messages byte-for-byte",
                 "preserve all non-tool-output records and tool call IDs",
                 "preserve images embedded in user messages",
@@ -763,7 +877,10 @@ def audit_policy_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> d
     changed_lines = {
         item["line"] for item in plan.get("transformation", {}).get("changed_lines", [])
     }
-    protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
+    protected_from, boundary_errors, expected_boundary = plan_boundary_metadata(
+        source_records, plan
+    )
+    errors.extend(boundary_errors)
     for line_number, (source_record, candidate_record, source_line, candidate_line) in enumerate(
         zip(source_records, candidate_records, source_lines, candidate_lines), start=1
     ):
@@ -784,6 +901,7 @@ def audit_policy_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> d
         "candidate": audit_snapshot_input(candidate_snapshot),
         "changed_lines": sorted(changed_lines),
         "protected_from": protected_from,
+        "boundary": expected_boundary,
     }
     return make_audit_stage(
         "policy",
@@ -806,13 +924,26 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
     candidate_lines = candidate_snapshot["lines"]
     source_lines = source_snapshot["lines"]
     options = plan.get("transformation", {})
-    protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
-    errors: list[str] = []
+    protected_from, boundary_errors, expected_boundary = plan_boundary_metadata(
+        source_records, plan
+    )
+    errors: list[str] = list(boundary_errors)
     try:
         max_output_bytes = int(options["max_output_bytes"])
         prefix_bytes = int(options["prefix_bytes"])
         suffix_bytes = int(options["suffix_bytes"])
-        validate_cleanup_options(DEFAULT_RECENT_RECORDS, max_output_bytes, prefix_bytes, suffix_bytes)
+        region = plan.get("protected_region", {})
+        recent_records = int(region.get("fallback_recent_records", DEFAULT_RECENT_RECORDS))
+        recent_compactions = int(
+            region.get("requested_logical_compactions", DEFAULT_RECENT_COMPACTIONS)
+        )
+        validate_cleanup_options(
+            recent_records,
+            max_output_bytes,
+            prefix_bytes,
+            suffix_bytes,
+            recent_compactions,
+        )
         expected = transform_lines(
             source_records,
             source_lines,
@@ -831,6 +962,7 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
         "source": audit_snapshot_input(source_snapshot),
         "candidate": audit_snapshot_input(candidate_snapshot),
         "protected_from": protected_from,
+        "boundary": expected_boundary,
         "transformation": options,
     }
     return make_audit_stage(
@@ -862,7 +994,10 @@ def audit_integrity_stage(source: Path, candidate: Path, plan: dict[str, Any]) -
         errors.append("session ID changed")
     if source_stats["visible_message_lines"] != candidate_stats["visible_message_lines"]:
         errors.append("visible message line sequence changed")
-    protected_from = int(plan.get("protected_region", {}).get("from_line", 1))
+    protected_from, boundary_errors, expected_boundary = plan_boundary_metadata(
+        source_records, plan
+    )
+    errors.extend(boundary_errors)
     old_candidate_images = 0
     for line_number, record in enumerate(candidate_records, start=1):
         payload = record.get("payload")
@@ -875,6 +1010,7 @@ def audit_integrity_stage(source: Path, candidate: Path, plan: dict[str, Any]) -
         "source": audit_snapshot_input(source_snapshot),
         "candidate": audit_snapshot_input(candidate_snapshot),
         "protected_from": protected_from,
+        "boundary": expected_boundary,
         "expected_source_sha256": plan.get("source", {}).get("sha256"),
         "expected_candidate_sha256": plan.get("candidate", {}).get("sha256"),
     }
@@ -1486,6 +1622,12 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--report-dir", type=Path, default=Path.cwd() / "session-cleanup-reports")
         if command == "plan":
             sub.add_argument("--recent-records", type=int, default=DEFAULT_RECENT_RECORDS)
+            sub.add_argument(
+                "--recent-compactions",
+                type=int,
+                default=DEFAULT_RECENT_COMPACTIONS,
+                help="preserve from this many latest logical compaction boundaries",
+            )
             sub.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
             sub.add_argument("--prefix-bytes", type=int, default=DEFAULT_PREFIX_BYTES)
             sub.add_argument("--suffix-bytes", type=int, default=DEFAULT_SUFFIX_BYTES)
@@ -1522,6 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolve_target(args.target, args.codex_home),
                 args.report_dir,
                 recent_records=args.recent_records,
+                recent_compactions=args.recent_compactions,
                 max_output_bytes=args.max_output_bytes,
                 prefix_bytes=args.prefix_bytes,
                 suffix_bytes=args.suffix_bytes,

@@ -59,12 +59,19 @@ The command writes a plan JSON, an unreviewed candidate JSONL, and prints the
 plan. Explain the exact changed line numbers, call IDs, original/candidate
 sizes, expected savings, image count, truncation count, and risk.
 
+Use `--recent-compactions 2` when the user requests the latest two logical
+compaction boundaries. Codex normally writes `compacted` and then
+`context_compacted` for one event. The plan records the selected boundary
+lines, and each audit recomputes them from the source file.
+
 The default plan is deliberately conservative:
 
 **Always preserve**
 
-- Every record from the latest `compacted`/`context_compacted` boundary onward.
-  If there is no compaction boundary, preserve the recent tail fallback.
+- Every record from the latest logical `compacted`/`context_compacted` boundary
+  onward by default. Use `--recent-compactions N` to preserve from the N most
+  recent logical boundaries. If there is no compaction boundary, preserve the
+  recent tail fallback.
 - All user and assistant visible messages, byte-for-byte.
 - `session_meta`, compaction records, turn/event records, reasoning, token
   counts, patches, tool calls, call IDs, and any record not confidently known

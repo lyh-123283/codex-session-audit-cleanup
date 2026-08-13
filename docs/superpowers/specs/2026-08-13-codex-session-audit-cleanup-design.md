@@ -23,13 +23,18 @@ bound to the source SHA-256.
 
 ## Adaptive Policy
 
-The plan generator analyzes the selected file and protects the latest
-compaction boundary (or recent-tail fallback), all visible messages, all
-non-tool-output records, tool calls and IDs, unknown fields, and user images.
-It considers only old tool-output records for change: structured image caches
-are replaced with a marker, and oversized outputs retain bounded prefix/suffix
-text. Complete-record deletion, age-only deletion, message summarization, and
-user-image clearing are out of scope for the first version.
+The plan generator analyzes the selected file and protects the latest logical
+compaction boundary by default (or a requested number of recent logical
+boundaries via `--recent-compactions`; if none exist, it uses the recent-tail
+fallback). A `compacted` record followed by its first `context_compacted`
+notification is one logical event; a context marker without a pending
+`compacted` record is treated as a standalone boundary. All visible messages,
+all non-tool-output records, tool calls and IDs, unknown fields, and user images
+remain protected. Only old tool-output records are candidates for change:
+structured image caches are replaced with a marker, and oversized outputs
+retain bounded prefix/suffix text. Complete-record deletion, age-only deletion,
+message summarization, and user-image clearing are out of scope for the first
+version.
 
 ## Review Gates
 
