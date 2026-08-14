@@ -537,7 +537,8 @@ class SessionCleanupTests(unittest.TestCase):
 
             preview = session_cleanup.prune_backups(backup_root, session_id, keep=1)
 
-            self.assertNotIn(str(alias.resolve()), preview["candidate_paths"])
+            self.assertIn(str(real_old.resolve()), preview["delete_paths"])
+            self.assertNotIn(str(alias.absolute()), preview["delete_paths"])
             result = session_cleanup.prune_backups(
                 backup_root,
                 session_id,
@@ -546,6 +547,7 @@ class SessionCleanupTests(unittest.TestCase):
             )
             self.assertEqual(result["status"], "success")
             self.assertTrue((backup_root / session_id / "newest").exists())
+            self.assertTrue(alias.is_symlink())
 
     def test_cli_backup_cleanup_workflow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
