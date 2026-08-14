@@ -1,8 +1,11 @@
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -128,6 +131,29 @@ def make_target_session(path):
                 },
             )
         write_record(handle, {"type": "compacted", "payload": {"summary": "target boundary"}})
+
+
+def make_backup_batch(backup_root, session_id, batch_id, created_at):
+    batch = Path(backup_root) / session_id / batch_id
+    batch.mkdir(parents=True)
+    original = batch / "original.jsonl"
+    original.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": session_id, "batch": batch_id}}) + "\n",
+        encoding="utf-8",
+    )
+    write_manifest(
+        batch / "manifest.json",
+        {
+            "backup_version": 2,
+            "backup_id": batch_id,
+            "session_id": session_id,
+            "status": "success",
+            "created_at": created_at,
+            "source_path": str(Path(backup_root).parent / f"{session_id}.jsonl"),
+            "original_sha256": sha256_file(original),
+        },
+    )
+    return batch
 
 
 class SessionCleanupTests(unittest.TestCase):
@@ -402,6 +428,183 @@ class SessionCleanupTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 build_plan(source, Path(temp_dir) / "reports", profile="balanced", target_bytes=1000)
+
+    def test_backups_cleanup_age_filter_keeps_recent_and_invalid_timestamp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            session_id = "session-1"
+            make_backup_batch(backup_root, session_id, "newest", "2026-08-13T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "second", "2026-07-01T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "old", "2026-06-01T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "invalid-time", "not-a-date")
+
+            preview = session_cleanup.prune_backups(
+                backup_root,
+                session_id,
+                keep=2,
+                older_than_days=30,
+                now=datetime(2026, 8, 14, tzinfo=timezone.utc),
+            )
+
+            self.assertEqual(preview["status"], "preview")
+            self.assertEqual(preview["retained_valid_successful"], 2)
+            self.assertIn("reclaimable_bytes", preview)
+            self.assertTrue(all(item["age_days"] >= 30 for item in preview["candidates"]))
+            self.assertTrue(any("invalid timestamp" in reason for reason in preview["preserved_reasons"]))
+
+    def test_backup_cleanup_confirmation_binds_age_filter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            session_id = "session-1"
+            make_backup_batch(backup_root, session_id, "newest", "2026-08-13T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "old", "2026-06-01T00:00:00Z")
+            preview = session_cleanup.prune_backups(
+                backup_root,
+                session_id,
+                keep=1,
+                older_than_days=30,
+                now=datetime(2026, 8, 14, tzinfo=timezone.utc),
+            )
+
+            with self.assertRaises(ValueError):
+                session_cleanup.prune_backups(
+                    backup_root,
+                    session_id,
+                    keep=1,
+                    older_than_days=0,
+                    confirm=preview["preview_id"],
+                )
+
+    def test_backup_cleanup_confirmation_requires_preview_version_two(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            session_id = "session-1"
+            make_backup_batch(backup_root, session_id, "newest", "2026-08-13T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "old", "2026-06-01T00:00:00Z")
+            preview = session_cleanup.prune_backups(backup_root, session_id, keep=1)
+            preview_path = backup_root / ".prune-previews" / f"{preview['preview_id']}.json"
+            stored = json.loads(preview_path.read_text(encoding="utf-8"))
+            stored["preview_version"] = 1
+            stored["preview_digest"] = self_digest(stored, "preview_digest")
+            preview_path.write_text(json.dumps(stored), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                session_cleanup.prune_backups(
+                    backup_root,
+                    session_id,
+                    keep=1,
+                    confirm=preview["preview_id"],
+                )
+
+    def test_backup_cleanup_never_counts_directory_symlink_as_recovery_point(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            session_id = "session-1"
+            make_backup_batch(backup_root, session_id, "newest", "2026-08-13T00:00:00Z")
+            real_old = make_backup_batch(backup_root, session_id, "old", "2026-06-01T00:00:00Z")
+            alias = backup_root / session_id / "old-alias"
+            try:
+                os.symlink(real_old, alias, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("directory symlinks are unavailable")
+
+            preview = session_cleanup.prune_backups(backup_root, session_id, keep=1)
+
+            self.assertNotIn(str(alias.resolve()), preview["candidate_paths"])
+            result = session_cleanup.prune_backups(
+                backup_root,
+                session_id,
+                keep=1,
+                confirm=preview["preview_id"],
+            )
+            self.assertEqual(result["status"], "success")
+            self.assertTrue((backup_root / session_id / "newest").exists())
+
+    def test_cli_backup_cleanup_workflow(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            session_id = "session-1"
+            make_backup_batch(backup_root, session_id, "newest", "2026-08-13T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "middle", "2026-07-01T00:00:00Z")
+            make_backup_batch(backup_root, session_id, "old", "2026-06-01T00:00:00Z")
+            command = [sys.executable, str(SCRIPT_DIR / "session_cleanup.py")]
+            preview_process = subprocess.run(
+                command
+                + [
+                    "backups",
+                    "cleanup",
+                    "--backup-root",
+                    str(backup_root),
+                    "--session-id",
+                    session_id,
+                    "--keep",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(preview_process.returncode, 0, preview_process.stderr)
+            preview = json.loads(preview_process.stdout)
+            self.assertEqual(preview["status"], "preview")
+            self.assertIn("reclaimable_bytes", preview)
+
+            confirm_process = subprocess.run(
+                command
+                + [
+                    "backups",
+                    "cleanup",
+                    "--backup-root",
+                    str(backup_root),
+                    "--session-id",
+                    session_id,
+                    "--keep",
+                    "1",
+                    "--confirm",
+                    preview["preview_id"],
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(confirm_process.returncode, 0, confirm_process.stderr)
+            self.assertEqual(json.loads(confirm_process.stdout)["status"], "success")
+
+    def test_cli_candidate_workflow(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            report_dir = root / "reports"
+            make_session(source)
+            command = [sys.executable, str(SCRIPT_DIR / "session_cleanup.py")]
+            plan_process = subprocess.run(
+                command
+                + ["plan", str(source), "--report-dir", str(report_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(plan_process.returncode, 0, plan_process.stderr)
+            plan_set = json.loads(plan_process.stdout)
+            self.assertIsInstance(plan_set["plan_set_id"], str)
+            self.assertGreaterEqual(len(plan_set["candidates"]), 1)
+            self.assertIn("source", plan_set)
+
+            audit_process = subprocess.run(
+                command + ["audit", plan_set["plan_set_path"]],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(audit_process.returncode, 0, audit_process.stderr)
+            audit = json.loads(audit_process.stdout)
+            self.assertEqual(audit["status"], "pass")
+            self.assertTrue(all(item["status"] == "pass" for item in audit["candidate_audits"]))
 
     def test_recent_compactions_preserves_from_second_latest_logical_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:

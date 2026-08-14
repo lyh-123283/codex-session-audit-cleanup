@@ -1928,7 +1928,99 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     }
 
 
-def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[str, Any]]:
+def parse_backup_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_backup_now(value: datetime | None = None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("backup evaluation time must include a timezone")
+    return current.astimezone(timezone.utc)
+
+
+def backup_directory_size(path: Path) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def backup_age_days(entry: dict[str, Any], now: datetime) -> int | None:
+    created = parse_backup_timestamp(entry.get("created_at"))
+    if created is None:
+        return None
+    seconds = (now - created).total_seconds()
+    return max(0, int(seconds // 86400))
+
+
+def backup_entry_sort_key(entry: dict[str, Any]) -> tuple[float, str, str]:
+    created = parse_backup_timestamp(entry.get("created_at"))
+    timestamp = created.timestamp() if created is not None else float("-inf")
+    return timestamp, str(entry.get("created_at", "")), str(entry.get("path", ""))
+
+
+def annotate_backup_entries(
+    entries: list[dict[str, Any]],
+    *,
+    keep: int,
+    older_than_days: int | None,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    if older_than_days is not None and older_than_days < 0:
+        raise ValueError("older_than_days must be non-negative")
+    valid = [
+        entry
+        for entry in entries
+        if entry.get("status") == "success" and entry.get("integrity") == "valid"
+    ]
+    valid.sort(key=backup_entry_sort_key, reverse=True)
+    retained_paths = {
+        str(Path(entry.get("path", "")).resolve()) for entry in valid[:keep] if entry.get("path")
+    }
+    for entry in entries:
+        path = Path(entry.get("path", "")).resolve() if entry.get("path") else None
+        entry["size_bytes"] = backup_directory_size(path) if path else 0
+        entry["age_days"] = backup_age_days(entry, now)
+        entry["deletion_eligible"] = False
+        if entry.get("status") != "success" or entry.get("integrity") != "valid":
+            entry["deletion_reason"] = "backup is not a valid successful recovery point"
+        elif path is None or str(path) in retained_paths:
+            entry["deletion_reason"] = "kept recovery point"
+        elif entry["age_days"] is None:
+            entry["deletion_reason"] = "invalid timestamp; preserved"
+        elif older_than_days is not None and entry["age_days"] < older_than_days:
+            entry["deletion_reason"] = f"younger than {older_than_days} days"
+        else:
+            entry["deletion_eligible"] = True
+            entry["deletion_reason"] = "eligible after keep and age filters"
+    return entries
+
+
+def list_backups(
+    backup_root: Path,
+    session_id: str | None = None,
+    *,
+    keep: int = 2,
+    older_than_days: int | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
     backup_root = backup_root.expanduser().resolve()
     if session_id is not None:
         validate_backup_session_id(session_id)
@@ -1937,15 +2029,32 @@ def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[
     roots = (
         [backup_root / session_id]
         if session_id
-        else [path for path in backup_root.iterdir() if path.is_dir() and path.name not in BACKUP_INTERNAL_DIRS]
+        else [
+            path
+            for path in backup_root.iterdir()
+            if path.is_dir() and not path.is_symlink() and path.name not in BACKUP_INTERNAL_DIRS
+        ]
     )
     result: list[dict[str, Any]] = []
     for session_root in roots:
+        if session_root.is_symlink():
+            continue
         if not session_root.is_dir() or session_root.name in BACKUP_INTERNAL_DIRS:
             continue
         for batch in session_root.iterdir():
             manifest_path = batch / "manifest.json"
             if not batch.is_dir():
+                continue
+            if batch.is_symlink():
+                result.append(
+                    {
+                        "path": str(batch.absolute()),
+                        "session_id": session_root.name,
+                        "status": "unknown",
+                        "integrity": "unknown",
+                        "reason": "symlinked backup directory is preserved",
+                    }
+                )
                 continue
             if not manifest_path.is_file():
                 result.append(
@@ -1979,11 +2088,21 @@ def list_backups(backup_root: Path, session_id: str | None = None) -> list[dict[
                         "reason": "manifest.json is unreadable",
                     }
                 )
-    return sorted(result, key=lambda item: str(item.get("created_at", "")), reverse=True)
+    evaluated_at = normalize_backup_now(now)
+    result.sort(key=backup_entry_sort_key, reverse=True)
+    return annotate_backup_entries(
+        result,
+        keep=keep,
+        older_than_days=older_than_days,
+        now=evaluated_at,
+    )
 
 
 def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) -> tuple[bool, str]:
-    path = Path(entry.get("path", "")).resolve()
+    raw_path = Path(entry.get("path", ""))
+    if raw_path.is_symlink():
+        return False, "backup directory is a symlink"
+    path = raw_path.resolve()
     try:
         ensure_inside(backup_root, path)
     except ValueError as error:
@@ -2012,24 +2131,64 @@ def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) 
     return True, "ok"
 
 
-def prune_snapshot(entries: list[dict[str, Any]], backup_root: Path, session_id: str, keep: int) -> dict[str, Any]:
+def prune_snapshot(
+    entries: list[dict[str, Any]],
+    backup_root: Path,
+    session_id: str,
+    keep: int,
+    *,
+    older_than_days: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    if older_than_days is not None and older_than_days < 0:
+        raise ValueError("older_than_days must be non-negative")
+    evaluation_now = normalize_backup_now(now)
     valid: list[dict[str, Any]] = []
     preserved: list[str] = []
+    preserved_reasons: list[str] = []
     invalid_reasons: dict[str, str] = {}
     for entry in entries:
+        path_value = entry.get("path")
+        if not path_value:
+            continue
+        path = str(Path(path_value).resolve())
         if entry.get("status") == "success":
             is_valid, reason = backup_integrity(entry, backup_root, session_id)
             if is_valid:
                 valid.append(entry)
             else:
-                path = str(Path(entry.get("path", "")).resolve())
                 preserved.append(path)
                 invalid_reasons[path] = reason
+                preserved_reasons.append(f"{path}: {reason}")
         else:
-            if entry.get("path"):
-                preserved.append(str(Path(entry["path"]).resolve()))
-    candidates = valid[keep:]
-    candidate_paths = [str(Path(entry["path"]).resolve()) for entry in candidates]
+            preserved.append(path)
+            preserved_reasons.append(f"{path}: backup status is not successful")
+    valid.sort(key=backup_entry_sort_key, reverse=True)
+    retained = valid[:keep]
+    retained_paths = {str(Path(entry["path"]).resolve()) for entry in retained}
+    candidates: list[dict[str, Any]] = []
+    for entry in valid[keep:]:
+        path = str(Path(entry["path"]).resolve())
+        age_days = backup_age_days(entry, evaluation_now)
+        if age_days is None:
+            preserved.append(path)
+            preserved_reasons.append(f"{path}: invalid timestamp; preserved")
+            continue
+        if older_than_days is not None and age_days < older_than_days:
+            preserved.append(path)
+            preserved_reasons.append(f"{path}: younger than {older_than_days} days")
+            continue
+        candidates.append(
+            {
+                "path": path,
+                "backup_id": entry.get("backup_id"),
+                "created_at": entry.get("created_at"),
+                "age_days": age_days,
+                "size_bytes": int(entry.get("size_bytes", backup_directory_size(Path(path)))),
+            }
+        )
     snapshot = []
     for entry in entries:
         if not entry.get("path"):
@@ -2039,26 +2198,57 @@ def prune_snapshot(entries: list[dict[str, Any]], backup_root: Path, session_id:
         snapshot.append(
             {
                 "path": str(entry_path),
+                "backup_id": entry.get("backup_id"),
+                "status": entry.get("status"),
+                "integrity": entry.get("integrity"),
+                "created_at": entry.get("created_at"),
+                "age_days": backup_age_days(entry, evaluation_now),
+                "size_bytes": int(entry.get("size_bytes", backup_directory_size(entry_path))),
                 "manifest_sha256": sha256_file(manifest_path) if manifest_path.is_file() else None,
                 "original_sha256": entry.get("original_sha256"),
             }
         )
+    candidate_paths = [item["path"] for item in candidates]
     return {
         "session_id": session_id,
         "keep_successful": keep,
+        "older_than_days": older_than_days,
+        "evaluation_now": evaluation_now.isoformat().replace("+00:00", "Z"),
+        "retained_valid_successful": len(retained),
+        "retained_paths": sorted(retained_paths),
+        "candidates": candidates,
         "candidate_paths": candidate_paths,
+        "reclaimable_bytes": sum(item["size_bytes"] for item in candidates),
         "preserved_paths": sorted(set(preserved)),
+        "preserved_reasons": sorted(set(preserved_reasons)),
         "invalid_reasons": invalid_reasons,
         "snapshot": snapshot,
     }
 
 
-def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm: str | bool | None = None) -> dict[str, Any]:
+def prune_backups(
+    backup_root: Path,
+    session_id: str,
+    *,
+    keep: int = 2,
+    confirm: str | bool | None = None,
+    older_than_days: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     if keep < 1:
         raise ValueError("keep must be at least 1")
+    if older_than_days is not None and older_than_days < 0:
+        raise ValueError("older_than_days must be non-negative")
     validate_backup_session_id(session_id)
     backup_root = backup_root.expanduser().resolve()
-    entries = list_backups(backup_root, session_id)
+    evaluation_now = normalize_backup_now(now)
+    entries = list_backups(
+        backup_root,
+        session_id,
+        keep=keep,
+        older_than_days=older_than_days,
+        now=evaluation_now,
+    )
     if confirm is True:
         raise ValueError("prune confirmation must be the preview_id returned by a prior preview")
     if isinstance(confirm, str):
@@ -2067,12 +2257,46 @@ def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm:
         if not preview_path.is_file():
             raise ValueError("unknown or expired prune preview_id")
         preview = read_json(preview_path)
+        if preview.get("preview_version") != 2:
+            raise ValueError("unsupported backup preview version; create a new preview")
         if preview.get("preview_id") != confirm:
             raise ValueError("prune preview identity mismatch")
         if preview.get("preview_digest") != self_digest(preview, "preview_digest"):
             raise ValueError("prune preview was changed after creation")
-        snapshot = prune_snapshot(entries, backup_root, session_id, keep)
-        if snapshot["snapshot"] != preview.get("snapshot") or snapshot["candidate_paths"] != preview.get("candidate_paths"):
+        if older_than_days != preview.get("older_than_days"):
+            raise ValueError("backup age filter changed after preview; create a new preview")
+        preview_now = parse_backup_timestamp(preview.get("evaluation_now")) or evaluation_now
+        preview_age = preview.get("older_than_days")
+        snapshot = prune_snapshot(
+            list_backups(
+                backup_root,
+                session_id,
+                keep=keep,
+                older_than_days=preview_age,
+                now=preview_now,
+            ),
+            backup_root,
+            session_id,
+            keep,
+            older_than_days=preview_age,
+            now=preview_now,
+        )
+        snapshot_fields = (
+            "session_id",
+            "keep_successful",
+            "older_than_days",
+            "evaluation_now",
+            "retained_valid_successful",
+            "retained_paths",
+            "candidates",
+            "candidate_paths",
+            "reclaimable_bytes",
+            "preserved_paths",
+            "preserved_reasons",
+            "invalid_reasons",
+            "snapshot",
+        )
+        if any(snapshot.get(field) != preview.get(field) for field in snapshot_fields):
             raise ValueError("backup set changed after preview; create a new preview")
         paths = [Path(path).resolve() for path in preview["candidate_paths"]]
         for path in paths:
@@ -2126,11 +2350,19 @@ def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm:
             "session_id": session_id,
             "deleted_count": len(paths),
             "deleted_paths": [str(path) for path in paths],
+            "reclaimed_bytes": int(preview.get("reclaimable_bytes", 0)),
         }
-    snapshot = prune_snapshot(entries, backup_root, session_id, keep)
+    snapshot = prune_snapshot(
+        entries,
+        backup_root,
+        session_id,
+        keep,
+        older_than_days=older_than_days,
+        now=evaluation_now,
+    )
     preview_id = uuid.uuid4().hex
     preview = {
-        "preview_version": 1,
+        "preview_version": 2,
         "preview_id": preview_id,
         "created_at": utc_now(),
         **snapshot,
@@ -2143,9 +2375,14 @@ def prune_backups(backup_root: Path, session_id: str, *, keep: int = 2, confirm:
         "preview_id": preview_id,
         "session_id": session_id,
         "keep_successful": keep,
+        "older_than_days": older_than_days,
+        "retained_valid_successful": snapshot["retained_valid_successful"],
         "delete_count": len(snapshot["candidate_paths"]),
         "delete_paths": snapshot["candidate_paths"],
+        "candidates": snapshot["candidates"],
+        "reclaimable_bytes": snapshot["reclaimable_bytes"],
         "preserved_paths": snapshot["preserved_paths"],
+        "preserved_reasons": snapshot["preserved_reasons"],
         "invalid_reasons": snapshot["invalid_reasons"],
     }
 
@@ -2306,9 +2543,24 @@ def build_parser() -> argparse.ArgumentParser:
                 default=DEFAULT_RECENT_COMPACTIONS,
                 help="preserve from this many latest logical compaction boundaries",
             )
-            sub.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
-            sub.add_argument("--prefix-bytes", type=int, default=DEFAULT_PREFIX_BYTES)
-            sub.add_argument("--suffix-bytes", type=int, default=DEFAULT_SUFFIX_BYTES)
+            sub.add_argument(
+                "--profile",
+                choices=("cache", "balanced", "space", "custom", "target"),
+                help="generate one named candidate; omit to compare cache, balanced, and space",
+            )
+            sub.add_argument("--max-output-bytes", type=int)
+            sub.add_argument("--prefix-bytes", type=int)
+            sub.add_argument("--suffix-bytes", type=int)
+            sub.add_argument("--target-bytes", type=int)
+            sub.add_argument(
+                "--problem",
+                choices=("image_cache", "oversized_output", "overall_size", "context_pressure"),
+            )
+            sub.add_argument(
+                "--retention-priority",
+                choices=("recent_content", "visible_messages", "user_images", "structural_fidelity"),
+            )
+            sub.add_argument("--allowed-strength", choices=("cache", "balanced", "space"))
     audit = subparsers.add_parser("audit")
     audit.add_argument("plan", type=Path)
     apply = subparsers.add_parser("apply")
@@ -2320,11 +2572,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = backups_sub.add_parser("list")
     list_parser.add_argument("--backup-root", type=Path, default=default_backup_root())
     list_parser.add_argument("--session-id")
-    prune = backups_sub.add_parser("prune")
-    prune.add_argument("--backup-root", type=Path, default=default_backup_root())
-    prune.add_argument("--session-id", required=True)
-    prune.add_argument("--keep", type=int, default=2)
-    prune.add_argument("--confirm", help="preview_id returned by a prior prune preview")
+    list_parser.add_argument("--keep", type=int, default=2)
+    list_parser.add_argument("--older-than-days", type=int)
+    for backups_action in ("prune", "cleanup"):
+        cleanup_parser = backups_sub.add_parser(backups_action)
+        cleanup_parser.add_argument("--backup-root", type=Path, default=default_backup_root())
+        cleanup_parser.add_argument("--session-id", required=True)
+        cleanup_parser.add_argument("--keep", type=int, default=2)
+        cleanup_parser.add_argument("--older-than-days", type=int)
+        cleanup_parser.add_argument("--confirm", help="preview_id returned by a prior backup cleanup preview")
     restore = subparsers.add_parser("restore")
     restore.add_argument("backup_dir", type=Path)
     restore.add_argument("--confirm", required=True)
@@ -2338,28 +2594,72 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "inspect":
             print_json(save_inspection(inspect_file(resolve_target(args.target, args.codex_home)), args.report_dir))
         elif args.command == "plan":
-            plan = build_plan(
-                resolve_target(args.target, args.codex_home),
-                args.report_dir,
-                recent_records=args.recent_records,
-                recent_compactions=args.recent_compactions,
-                max_output_bytes=args.max_output_bytes,
-                prefix_bytes=args.prefix_bytes,
-                suffix_bytes=args.suffix_bytes,
+            source = resolve_target(args.target, args.codex_home)
+            manual_thresholds = (args.max_output_bytes, args.prefix_bytes, args.suffix_bytes)
+            if args.profile is None and any(value is not None for value in manual_thresholds + (args.target_bytes,)):
+                raise ValueError("--profile is required when using custom thresholds or --target-bytes")
+            if args.profile in {"cache", "balanced", "space"} and any(value is not None for value in manual_thresholds):
+                raise ValueError("manual output thresholds require --profile custom")
+            if args.profile != "target" and args.target_bytes is not None:
+                raise ValueError("--target-bytes requires --profile target")
+            stats = inspect_file(source)["stats"]
+            intent = build_intent_profile(
+                stats,
+                problem=args.problem,
+                retention_priority=args.retention_priority,
+                allowed_strength=args.allowed_strength,
+                target_bytes=args.target_bytes,
             )
+            if args.profile is None:
+                plan = build_plan_set(
+                    source,
+                    args.report_dir,
+                    intent_profile=intent,
+                    recent_records=args.recent_records,
+                    recent_compactions=args.recent_compactions,
+                )
+            else:
+                plan = build_plan(
+                    source,
+                    args.report_dir,
+                    recent_records=args.recent_records,
+                    recent_compactions=args.recent_compactions,
+                    max_output_bytes=args.max_output_bytes,
+                    prefix_bytes=args.prefix_bytes,
+                    suffix_bytes=args.suffix_bytes,
+                    profile=args.profile,
+                    intent_profile=intent,
+                    target_bytes=args.target_bytes,
+                )
             print_json(plan)
-            return 0 if plan["status"] == "ready_for_review" else 2
+            return 0 if plan["status"] in {"ready_for_review", "no_change"} else 2
         elif args.command == "audit":
-            audit = audit_plan(args.plan)
+            plan_document = read_json(args.plan)
+            audit = audit_plan_set(args.plan) if "plan_set_version" in plan_document else audit_plan(args.plan)
             print_json(audit)
             return 0 if audit["status"] == "pass" else 1
         elif args.command == "apply":
             print_json(apply_plan(args.plan, args.confirm, args.backup_root))
         elif args.command == "backups":
             if args.backups_command == "list":
-                print_json(list_backups(args.backup_root, args.session_id))
+                print_json(
+                    list_backups(
+                        args.backup_root,
+                        args.session_id,
+                        keep=args.keep,
+                        older_than_days=args.older_than_days,
+                    )
+                )
             else:
-                print_json(prune_backups(args.backup_root, args.session_id, keep=args.keep, confirm=args.confirm))
+                print_json(
+                    prune_backups(
+                        args.backup_root,
+                        args.session_id,
+                        keep=args.keep,
+                        confirm=args.confirm,
+                        older_than_days=args.older_than_days,
+                    )
+                )
         elif args.command == "restore":
             print_json(restore_backup(args.backup_dir, args.confirm, args.target))
         return 0
