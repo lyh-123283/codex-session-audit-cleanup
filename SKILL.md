@@ -199,9 +199,10 @@ python scripts/session_cleanup.py backups cleanup `
   --keep 2 --older-than-days 2
 ```
 
-The preview includes `preview_id`, exact deletion paths, reclaimable bytes,
-retained paths, preservation reasons, and a complete backup snapshot. Only
-after the user reviews it, confirm the same preview:
+The preview includes `preview_id`, `preview_path`, `preview_digest`, exact
+deletion paths, reclaimable bytes, retained paths, preservation reasons, and a
+complete backup snapshot. Only after the user reviews it, confirm the same
+preview:
 
 ```powershell
 python scripts/session_cleanup.py backups cleanup `
@@ -220,12 +221,15 @@ Restore only to the original source path recorded in the manifest:
 
 ```powershell
 python scripts/session_cleanup.py restore "<backup-directory>" `
+  --backup-root "<backup-root>" `
   --confirm "<backup-id>"
 ```
 
-The helper verifies the backup digest, SHA-256, JSONL parseability, target lock,
-and post-restore hash. A restore target cannot be redirected to another
-conversation.
+The helper requires the batch to be directly under
+`<backup-root>/<session-id>/<backup-id>`, rejects symlinked batch/session
+directories and unsupported manifest versions, and verifies the backup digest,
+SHA-256, JSONL parseability, target lock, and post-restore hash. A restore
+target cannot be redirected to another conversation.
 
 ## Helper Contract
 

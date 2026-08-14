@@ -94,7 +94,8 @@ A single candidate plan is a JSON object with these core fields:
 plan_version, plan_id, candidate_kind, requested_profile, status,
 created_at, source, candidate, candidate_path, report_path, audit_path,
 session_id, source_stats, intent_profile, policy, target, locks,
-protected_region, transformation, summary, review_requirements, plan_digest
+protected_region, transformation, summary, review_requirements, plan_digest,
+residual_risk
 ```
 
 `plan_version` is `3`; plans with version `2` or earlier must be regenerated.
@@ -127,6 +128,9 @@ metadata includes `target_bytes`, lower/upper profile sizes, source size,
 
 `summary` contains `original_bytes`, `candidate_bytes`, `bytes_saved`,
 `changed_records`, `image_payloads_cleared`, and `truncated_outputs`.
+`residual_risk` is deterministic metadata containing the requested profile,
+an impact level, bounded risk items, the selected policy, and the protected
+boundary lines. It is review metadata, not a model-generated summary.
 `transformation.changed_lines` is the human-review list of line numbers,
 call IDs, reasons, and byte effects. `protected_region` contains the selected
 boundary metadata and preservation rules.
@@ -147,8 +151,9 @@ second plan, and contains:
 
 ```text
 plan_id, plan_path, candidate_path, audit_path, source_sha256,
-policy, candidate_bytes, bytes_saved, changed_records,
-image_payloads_cleared, truncated_outputs, audit_status
+requested_profile, status, policy, original_bytes, candidate_bytes,
+bytes_saved, changed_records, image_payloads_cleared, truncated_outputs,
+protected_region, residual_risk, audit_status
 ```
 
 The plan-set digest binds the complete index. Audit may update its audit
@@ -185,7 +190,8 @@ modification.
 ## Backup Manifest
 
 Each successful apply creates a directory containing `original.jsonl` and
-`manifest.json`. The manifest starts with `backup_version: 1` and includes:
+`manifest.json`. The manifest starts with `backup_version: 1`; only this
+version is accepted as an intact managed recovery point. It includes:
 
 ```text
 backup_version, backup_id, session_id, status, created_at,
@@ -220,7 +226,9 @@ preserved_reasons, invalid_reasons, snapshot, preview_digest
 ```
 
 The user-facing preview also reports `status: preview`, `delete_count`, and
-`delete_paths`. `snapshot` contains each backup path, ID, status, integrity,
+`delete_paths`. The CLI result additionally includes `preview_path`,
+`preview_digest`, `evaluation_now`, and `retained_paths`. `snapshot` contains
+each backup path, ID, status, integrity,
 creation time, age, size, manifest SHA-256, and original SHA-256. The
 `preview_digest` binds all fields except itself.
 
@@ -229,6 +237,11 @@ The helper recomputes the complete snapshot, keep count, age filter, candidate
 paths, and integrity before moving candidates into quarantine. Failed,
 unknown, invalid, symlinked, and invalid-timestamp backups are never automatic
 deletion targets. `keep >= 1`; `older_than_days`, when present, is `>= 0`.
+
+Restore requires an explicit managed root and accepts only a batch directly
+under `<backup-root>/<session-id>/<backup-id>`. The batch and session
+directory may not be symlinks, and the manifest session/backup IDs must match
+the directory names.
 
 ## Adding a Transformation
 

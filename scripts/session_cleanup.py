@@ -26,6 +26,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_PREFIX_BYTES = 8 * 1024
 DEFAULT_SUFFIX_BYTES = 4 * 1024
 PLAN_VERSION = 3
+BACKUP_VERSION = 1
 PROFILE_POLICIES = {
     "cache": {
         "profile": "cache",
@@ -846,6 +847,38 @@ def write_candidate(
     }
 
 
+def build_residual_risk(
+    requested_profile: str,
+    policy: dict[str, Any],
+    protected_region: dict[str, Any],
+    summary: dict[str, Any],
+    status: str,
+) -> dict[str, Any]:
+    items: list[str] = []
+    if status == "infeasible":
+        items.append("the requested target cannot be reached without changing protected content")
+    elif status == "no_change":
+        items.append("no source content would be changed by this candidate")
+    else:
+        if summary.get("image_payloads_cleared", 0):
+            items.append("old tool-output image cache payloads are replaced by markers and are not recoverable from the candidate")
+        if summary.get("truncated_outputs", 0):
+            items.append("middle sections of oversized old tool outputs are omitted from the candidate")
+        if not items:
+            items.append("no eligible old tool-output payload was changed")
+    if status not in {"infeasible", "no_change"}:
+        items.append("protected recent records, visible messages, user images, and structural IDs remain unchanged")
+    return {
+        "profile": requested_profile,
+        "level": "blocked" if status in {"blocked", "infeasible"} else ("moderate" if summary.get("truncated_outputs", 0) else "low"),
+        "items": items,
+        "selected_policy": copy.deepcopy(policy),
+        "protected_from_line": protected_region.get("from_line"),
+        "selected_boundary_lines": list(protected_region.get("selected_boundary_lines", [])),
+        "mitigation": "apply creates a byte-for-byte original backup before replacement",
+    }
+
+
 def inspect_file(path: Path) -> dict[str, Any]:
     path = validate_session_path(path)
     if not path.is_file():
@@ -983,6 +1016,22 @@ def validate_plan_semantics(plan: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_residual_risk(plan: dict[str, Any]) -> list[str]:
+    risk = plan.get("residual_risk")
+    if not isinstance(risk, dict):
+        return ["residual risk metadata is missing; regenerate the plan"]
+    expected = build_residual_risk(
+        str(plan.get("requested_profile")),
+        plan.get("policy") if isinstance(plan.get("policy"), dict) else {},
+        plan.get("protected_region") if isinstance(plan.get("protected_region"), dict) else {},
+        plan.get("summary") if isinstance(plan.get("summary"), dict) else {},
+        str(plan.get("status")),
+    )
+    if risk != expected:
+        return ["residual risk metadata does not match the plan"]
+    return []
+
+
 def build_plan(
     source: Path,
     report_dir: Path,
@@ -1105,6 +1154,13 @@ def build_plan(
         plan["blocking_reasons"] = ["target_size_infeasible"]
     elif selection_status == "no_change":
         plan["blocking_reasons"] = ["target_already_satisfied"]
+    plan["residual_risk"] = build_residual_risk(
+        requested_profile,
+        policy,
+        plan["protected_region"],
+        plan["summary"],
+        plan["status"],
+    )
     plan["plan_digest"] = self_digest(plan, "plan_digest")
     write_json(Path(plan["report_path"]), plan)
     return plan
@@ -1166,12 +1222,17 @@ def build_plan_set(
                 "candidate_path": plan["candidate_path"],
                 "audit_path": plan["audit_path"],
                 "source_sha256": plan["source"]["sha256"],
+                "requested_profile": plan["requested_profile"],
+                "status": plan["status"],
                 "policy": copy.deepcopy(plan["policy"]),
+                "original_bytes": plan["summary"]["original_bytes"],
                 "candidate_bytes": plan["summary"]["candidate_bytes"],
                 "bytes_saved": plan["summary"]["bytes_saved"],
                 "changed_records": plan["summary"]["changed_records"],
                 "image_payloads_cleared": plan["summary"]["image_payloads_cleared"],
                 "truncated_outputs": plan["summary"]["truncated_outputs"],
+                "protected_region": copy.deepcopy(plan["protected_region"]),
+                "residual_risk": copy.deepcopy(plan["residual_risk"]),
                 "audit_status": "pending",
             }
         )
@@ -1597,6 +1658,7 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
     plan_errors: list[str] = []
     plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
     plan_errors.extend(validate_plan_semantics(plan))
+    plan_errors.extend(validate_residual_risk(plan))
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
         plan_errors.append("plan digest changed")
     if plan.get("status") != "ready_for_review":
@@ -1685,6 +1747,11 @@ def audit_plan_set(plan_set_path: Path) -> dict[str, Any]:
                 errors.append(f"candidate {plan_id}: plan-set index audit path does not match candidate")
             if item.get("candidate_path") != candidate_plan.get("candidate_path"):
                 errors.append(f"candidate {plan_id}: plan-set index candidate path does not match candidate")
+            for field in ("requested_profile", "status", "protected_region", "residual_risk"):
+                if item.get(field) != candidate_plan.get(field):
+                    errors.append(f"candidate {plan_id}: plan-set index {field} does not match candidate")
+            if item.get("original_bytes") != candidate_plan.get("summary", {}).get("original_bytes"):
+                errors.append(f"candidate {plan_id}: plan-set index original bytes do not match candidate")
             if item.get("policy") != candidate_plan.get("policy"):
                 errors.append(f"candidate {plan_id}: plan-set index policy does not match candidate")
             profile = candidate_plan.get("policy", {}).get("profile")
@@ -1807,6 +1874,9 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     semantic_errors = validate_plan_semantics(plan)
     if semantic_errors:
         raise ValueError("invalid cleanup plan semantics: " + "; ".join(semantic_errors))
+    residual_risk_errors = validate_residual_risk(plan)
+    if residual_risk_errors:
+        raise ValueError("invalid residual risk metadata: " + "; ".join(residual_risk_errors))
     if plan.get("status") != "ready_for_review":
         raise ValueError("plan is not ready for review")
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
@@ -2098,6 +2168,19 @@ def list_backups(
     )
 
 
+def checked_backup_file(backup_dir: Path, filename: str) -> Path:
+    path = backup_dir / filename
+    if path.is_symlink():
+        raise ValueError(f"backup file must not be a symlink: {path}")
+    try:
+        ensure_inside(backup_dir, path.resolve())
+    except ValueError as error:
+        raise ValueError(f"backup file escapes its batch directory: {path}") from error
+    if not path.is_file():
+        raise ValueError(f"backup file is missing: {path}")
+    return path
+
+
 def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) -> tuple[bool, str]:
     raw_path = Path(entry.get("path", ""))
     if raw_path.is_symlink():
@@ -2109,10 +2192,16 @@ def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) 
         return False, str(error)
     if entry.get("session_id") != session_id or entry.get("status") != "success":
         return False, "not a successful backup for this session"
-    if not path.is_dir() or not (path / "manifest.json").is_file() or not (path / "original.jsonl").is_file():
+    if entry.get("backup_version") != BACKUP_VERSION:
+        return False, f"unsupported backup version: {entry.get('backup_version')!r}"
+    if not path.is_dir():
         return False, "backup files are incomplete"
     try:
-        manifest = read_json(path / "manifest.json")
+        manifest_path = checked_backup_file(path, "manifest.json")
+        original_path = checked_backup_file(path, "original.jsonl")
+        manifest = read_json(manifest_path)
+        if manifest.get("backup_version") != BACKUP_VERSION:
+            return False, f"unsupported backup version: {manifest.get('backup_version')!r}"
         if manifest.get("backup_id") != entry.get("backup_id"):
             return False, "manifest identity changed"
         if manifest.get("manifest_digest") != self_digest(manifest, "manifest_digest"):
@@ -2121,9 +2210,9 @@ def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) 
         if not isinstance(source_path, str):
             return False, "manifest source path is missing"
         validate_session_path(Path(source_path))
-        if sha256_file(path / "original.jsonl") != manifest.get("original_sha256"):
+        if sha256_file(original_path) != manifest.get("original_sha256"):
             return False, "original backup hash mismatch"
-        records, _, errors = parse_jsonl(path / "original.jsonl")
+        records, _, errors = parse_jsonl(original_path)
         if not records or errors:
             return False, "original backup is not valid JSONL"
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -2372,11 +2461,15 @@ def prune_backups(
     write_json(preview_path, preview)
     return {
         "status": "preview",
+        "preview_version": preview["preview_version"],
         "preview_id": preview_id,
+        "preview_path": str(preview_path),
         "session_id": session_id,
         "keep_successful": keep,
         "older_than_days": older_than_days,
+        "evaluation_now": snapshot["evaluation_now"],
         "retained_valid_successful": snapshot["retained_valid_successful"],
+        "retained_paths": snapshot["retained_paths"],
         "delete_count": len(snapshot["candidate_paths"]),
         "delete_paths": snapshot["candidate_paths"],
         "candidates": snapshot["candidates"],
@@ -2384,19 +2477,48 @@ def prune_backups(
         "preserved_paths": snapshot["preserved_paths"],
         "preserved_reasons": snapshot["preserved_reasons"],
         "invalid_reasons": snapshot["invalid_reasons"],
+        "snapshot": snapshot["snapshot"],
+        "preview_digest": preview["preview_digest"],
     }
 
 
-def restore_backup(backup_dir: Path, confirmation: str, target: Path | None = None) -> dict[str, Any]:
-    backup_dir = backup_dir.expanduser().resolve()
-    manifest = read_json(backup_dir / "manifest.json")
+def restore_backup(
+    backup_dir: Path,
+    confirmation: str,
+    target: Path | None = None,
+    *,
+    backup_root: Path | None = None,
+) -> dict[str, Any]:
+    raw_backup_dir = backup_dir.expanduser()
+    raw_backup_root = (backup_root or default_backup_root()).expanduser()
+    if raw_backup_dir.is_symlink():
+        raise ValueError("backup directory must not be a symlink")
+    if raw_backup_root.is_symlink():
+        raise ValueError("backup root must not be a symlink")
+    if raw_backup_dir.parent.is_symlink():
+        raise ValueError("backup session directory must not be a symlink")
+    managed_root = raw_backup_root.resolve()
+    backup_dir = raw_backup_dir.resolve()
+    ensure_inside(managed_root, backup_dir)
+    if backup_dir.parent.parent != managed_root:
+        raise ValueError("backup directory must be directly under backup_root/session_id")
+    manifest_path = checked_backup_file(backup_dir, "manifest.json")
+    original = checked_backup_file(backup_dir, "original.jsonl")
+    manifest = read_json(manifest_path)
+    if manifest.get("backup_version") != BACKUP_VERSION:
+        raise ValueError(f"unsupported backup version: {manifest.get('backup_version')!r}")
+    manifest_session_id = manifest.get("session_id")
+    validate_backup_session_id(manifest_session_id)
+    if backup_dir.parent.name != manifest_session_id:
+        raise ValueError("backup session directory does not match manifest session_id")
+    if backup_dir.name != manifest.get("backup_id"):
+        raise ValueError("backup directory name does not match manifest backup_id")
     if manifest.get("manifest_digest") != self_digest(manifest, "manifest_digest"):
         raise ValueError("manifest digest mismatch")
     if confirmation != manifest.get("backup_id"):
         raise ValueError("confirmation must exactly equal backup_id")
     if manifest.get("status") != "success":
         raise ValueError("only successful backups can be restored")
-    original = backup_dir / "original.jsonl"
     if sha256_file(original) != manifest.get("original_sha256"):
         raise ValueError("backup content hash mismatch")
     backup_records, _, backup_errors = parse_jsonl(original)
@@ -2584,6 +2706,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore = subparsers.add_parser("restore")
     restore.add_argument("backup_dir", type=Path)
     restore.add_argument("--confirm", required=True)
+    restore.add_argument("--backup-root", type=Path, default=default_backup_root())
     restore.add_argument("--target", type=Path)
     return parser
 
@@ -2661,7 +2784,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
         elif args.command == "restore":
-            print_json(restore_backup(args.backup_dir, args.confirm, args.target))
+            print_json(
+                restore_backup(
+                    args.backup_dir,
+                    args.confirm,
+                    args.target,
+                    backup_root=args.backup_root,
+                )
+            )
         return 0
     except (FileNotFoundError, OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)

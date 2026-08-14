@@ -144,7 +144,7 @@ def make_backup_batch(backup_root, session_id, batch_id, created_at):
     write_manifest(
         batch / "manifest.json",
         {
-            "backup_version": 2,
+            "backup_version": 1,
             "backup_id": batch_id,
             "session_id": session_id,
             "status": "success",
@@ -235,6 +235,23 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertEqual(audit["status"], "fail")
             self.assertTrue(any("policy metadata" in error for error in audit["errors"]))
 
+    def test_audit_rejects_missing_residual_risk_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan = build_plan(source, root / "reports")
+            plan.pop("residual_risk")
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+
+            audit = audit_plan(Path(plan["report_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("residual risk" in error for error in audit["errors"]))
+
     def test_plan_set_has_independent_profiles_and_intent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -266,6 +283,12 @@ class SessionCleanupTests(unittest.TestCase):
                 {entry["policy"]["profile"] for entry in result["candidates"]},
                 {"cache", "balanced", "space"},
             )
+            for entry in result["candidates"]:
+                plan = json.loads(Path(entry["plan_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(entry["status"], plan["status"])
+                self.assertEqual(entry["original_bytes"], plan["summary"]["original_bytes"])
+                self.assertEqual(entry["protected_region"], plan["protected_region"])
+                self.assertEqual(entry["residual_risk"], plan["residual_risk"])
             self.assertTrue(Path(result["plan_set_path"]).is_file())
 
     def test_audit_plan_set_audits_each_candidate(self):
@@ -553,6 +576,14 @@ class SessionCleanupTests(unittest.TestCase):
             preview = json.loads(preview_process.stdout)
             self.assertEqual(preview["status"], "preview")
             self.assertIn("reclaimable_bytes", preview)
+            self.assertIn("evaluation_now", preview)
+            self.assertIn("retained_paths", preview)
+            self.assertIn("snapshot", preview)
+            self.assertIn("preview_digest", preview)
+            self.assertIn("preview_path", preview)
+            stored_preview = json.loads(Path(preview["preview_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(stored_preview["preview_digest"], preview["preview_digest"])
+            self.assertEqual(stored_preview["snapshot"], preview["snapshot"])
 
             confirm_process = subprocess.run(
                 command
@@ -574,6 +605,91 @@ class SessionCleanupTests(unittest.TestCase):
             )
             self.assertEqual(confirm_process.returncode, 0, confirm_process.stderr)
             self.assertEqual(json.loads(confirm_process.stdout)["status"], "success")
+
+    def test_restore_rejects_backup_directory_outside_managed_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            report_dir = root / "reports"
+            backup_root = root / "backups"
+            make_session(source)
+            plan = build_plan(source, report_dir)
+            audit_plan(Path(plan["report_path"]))
+            result = apply_plan(Path(plan["report_path"]), plan["plan_id"], backup_root)
+
+            untrusted = root / "untrusted" / "session-1" / result["backup_id"]
+            untrusted.parent.mkdir(parents=True)
+            shutil.copytree(result["backup_path"], untrusted)
+
+            with self.assertRaises(ValueError):
+                restore_backup(untrusted, result["backup_id"])
+
+    def test_restore_rejects_symlinked_backup_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            report_dir = root / "reports"
+            backup_root = root / "backups"
+            make_session(source)
+            plan = build_plan(source, report_dir)
+            audit_plan(Path(plan["report_path"]))
+            result = apply_plan(Path(plan["report_path"]), plan["plan_id"], backup_root)
+            batch = Path(result["backup_path"])
+            real_is_symlink = Path.is_symlink
+
+            def pretend_file_symlinks(path):
+                if Path(path).resolve() in {batch / "manifest.json", batch / "original.jsonl"}:
+                    return True
+                return real_is_symlink(path)
+
+            with mock.patch.object(Path, "is_symlink", autospec=True, side_effect=pretend_file_symlinks):
+                with self.assertRaises(ValueError):
+                    restore_backup(batch, result["backup_id"], backup_root=backup_root)
+                listed = list_backups(backup_root, session_id="session-1")
+            self.assertEqual(listed[0]["integrity"], "invalid")
+
+    def test_cli_restore_accepts_explicit_managed_backup_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            report_dir = root / "reports"
+            backup_root = root / "backups"
+            make_session(source)
+            plan = build_plan(source, report_dir)
+            audit_plan(Path(plan["report_path"]))
+            result = apply_plan(Path(plan["report_path"]), plan["plan_id"], backup_root)
+            command = [
+                sys.executable,
+                str(SCRIPT_DIR / "session_cleanup.py"),
+                "restore",
+                result["backup_path"],
+                "--backup-root",
+                str(backup_root),
+                "--confirm",
+                result["backup_id"],
+            ]
+
+            restore_process = subprocess.run(command, capture_output=True, text=True, check=False)
+
+            self.assertEqual(restore_process.returncode, 0, restore_process.stderr)
+            self.assertEqual(json.loads(restore_process.stdout)["status"], "success")
+
+    def test_backup_listing_rejects_unknown_manifest_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backup_root = root / "backups"
+            batch = make_backup_batch(backup_root, "session-1", "unknown-version", "2026-08-13T00:00:00Z")
+            manifest_path = batch / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["backup_version"] = 99
+            write_manifest(manifest_path, manifest)
+
+            entries = list_backups(backup_root, session_id="session-1")
+
+            self.assertEqual(entries[0]["integrity"], "invalid")
+            self.assertIn("version", entries[0]["integrity_error"])
+            with self.assertRaises(ValueError):
+                restore_backup(batch, "unknown-version", backup_root=backup_root)
 
     def test_cli_candidate_workflow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -874,7 +990,11 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0]["status"], "success")
 
-            restored_hash = restore_backup(Path(result["backup_path"]), result["backup_id"])
+            restored_hash = restore_backup(
+                Path(result["backup_path"]),
+                result["backup_id"],
+                backup_root=backup_root,
+            )
             self.assertEqual(restored_hash["status"], "success")
             self.assertEqual(source.read_bytes(), Path(result["backup_path"], "original.jsonl").read_bytes())
 
@@ -889,6 +1009,7 @@ class SessionCleanupTests(unittest.TestCase):
             (batch / "manifest.json").write_text(
                 json.dumps(
                     {
+                        "backup_version": 1,
                         "backup_id": "corrupt",
                         "session_id": "session-1",
                         "status": "success",
@@ -934,7 +1055,12 @@ class SessionCleanupTests(unittest.TestCase):
             result = apply_plan(Path(plan["report_path"]), plan["plan_id"], backup_root)
 
             with self.assertRaises(ValueError):
-                restore_backup(Path(result["backup_path"]), result["backup_id"], root / "other.jsonl")
+                restore_backup(
+                    Path(result["backup_path"]),
+                    result["backup_id"],
+                    root / "other.jsonl",
+                    backup_root=backup_root,
+                )
 
     def test_restore_rolls_back_when_post_replace_validation_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -959,7 +1085,11 @@ class SessionCleanupTests(unittest.TestCase):
 
             with mock.patch.object(session_cleanup, "sha256_file", side_effect=fail_after_replace):
                 with self.assertRaises(ValueError):
-                    restore_backup(Path(result["backup_path"]), result["backup_id"])
+                    restore_backup(
+                        Path(result["backup_path"]),
+                        result["backup_id"],
+                        backup_root=backup_root,
+                    )
 
             self.assertEqual(source.read_bytes(), current_content)
 
@@ -1010,7 +1140,7 @@ class SessionCleanupTests(unittest.TestCase):
                 write_manifest(
                     batch / "manifest.json",
                     {
-                        "backup_version": 2,
+                        "backup_version": 1,
                         "backup_id": f"batch-{index}",
                         "session_id": "session-1",
                         "status": "success",
@@ -1025,6 +1155,7 @@ class SessionCleanupTests(unittest.TestCase):
             (corrupt / "manifest.json").write_text(
                 json.dumps(
                     {
+                        "backup_version": 1,
                         "backup_id": "corrupt",
                         "session_id": "session-1",
                         "status": "success",
@@ -1131,7 +1262,7 @@ class SessionCleanupTests(unittest.TestCase):
                 write_manifest(
                     batch / "manifest.json",
                     {
-                        "backup_version": 2,
+                        "backup_version": 1,
                         "backup_id": f"batch-{index}",
                         "session_id": "session-1",
                         "status": status,
@@ -1170,7 +1301,7 @@ class SessionCleanupTests(unittest.TestCase):
                 write_manifest(
                     batch / "manifest.json",
                     {
-                        "backup_version": 2,
+                        "backup_version": 1,
                         "backup_id": f"batch-{index}",
                         "session_id": "session-1",
                         "status": "success",
@@ -1220,7 +1351,11 @@ class SessionCleanupTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
             with self.assertRaises(ValueError):
-                restore_backup(Path(result["backup_path"]), result["backup_id"])
+                restore_backup(
+                    Path(result["backup_path"]),
+                    result["backup_id"],
+                    backup_root=backup_root,
+                )
 
 
 if __name__ == "__main__":

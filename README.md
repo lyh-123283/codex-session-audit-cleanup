@@ -133,6 +133,12 @@ This writes:
 Each candidate has an independent `plan_id`. The `plan_set_id` is only for
 grouping and cannot be used as `apply --confirm`.
 
+Each candidate comparison entry is bound to its plan's requested profile,
+status, original size, policy, protected boundary metadata, and structured
+`residual_risk`. Review those fields together with the change list; the risk
+description distinguishes cache replacement from omitted middle sections of
+truncated old outputs.
+
 Generate one named candidate when needed:
 
 ```powershell
@@ -246,8 +252,9 @@ python scripts/session_cleanup.py backups cleanup `
 
 Without `--confirm`, the command returns `status: preview`, a `preview_id`,
 exact `delete_paths`, candidate sizes and ages, `reclaimable_bytes`, retained
-paths, preservation reasons, invalid reasons, and a complete backup snapshot.
-Review that output before confirming:
+paths, preservation reasons, invalid reasons, a complete backup snapshot, and
+the persisted `preview_path`/`preview_digest`. Review that output before
+confirming:
 
 ```powershell
 python scripts/session_cleanup.py backups cleanup `
@@ -265,13 +272,16 @@ rechecked, moved into `.prune-quarantine`, and only then recursively deleted.
 
 ```powershell
 python scripts/session_cleanup.py restore "<backup-directory>" `
+  --backup-root ".\session-cleanup-backups" `
   --confirm "<backup-id>"
 ```
 
 Restore requires the exact manifest `backup_id`, a valid manifest and original
-hash, valid JSONL, and no writer lock. It can restore only to the original
-`source_path` in the manifest; an alternate conversation is rejected. The
-target is hash-checked and parsed after restore, with rollback attempted if
+hash, valid JSONL, and no writer lock. The backup directory must be directly
+under `<backup-root>/<session-id>/<backup-id>` and must not be a symlink;
+unsupported manifest versions are rejected. It can restore only to the
+original `source_path` in the manifest; an alternate conversation is rejected.
+The target is hash-checked and parsed after restore, with rollback attempted if
 post-restore verification fails.
 
 ## Safety Boundaries
