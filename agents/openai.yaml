@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Session Audit & Cleanup"
   short_description: "Audit and conservatively clean Codex session history"
-  default_prompt: "Use $codex-session-audit-cleanup to audit one specified Codex conversation file, show a multi-stage cleanup plan, and only apply it after explicit confirmation."
+  default_prompt: "Use $codex-session-audit-cleanup to audit one specified Codex conversation file, compare independently audited cleanup candidates, and apply only the exact candidate plan ID I confirm."

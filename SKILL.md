@@ -1,38 +1,40 @@
 ---
 name: codex-session-audit-cleanup
-description: Audit and conservatively clean one specified Codex conversation history JSONL file on disk. Use when a user names a Codex conversation, session ID, or JSONL path and wants its stored history analyzed, an adaptive cleanup plan shown and independently checked, old tool-output image caches or oversized outputs reduced, backups managed or restored, and changes applied only after explicit confirmation. This skill does not edit the active runtime context, session index, SQLite databases, or writer locks.
+description: Audit and conservatively clean one specified Codex conversation history JSONL file on disk. Use when a user names a Codex conversation, session ID, or JSONL path and wants its stored history analyzed, an adaptive multi-candidate cleanup plan shown and independently checked, old tool-output image caches or oversized outputs reduced, backups managed or restored, and changes applied only after explicit confirmation. This skill does not edit the active runtime context, session index, SQLite databases, or writer locks.
 ---
 
 # Codex Session Audit & Cleanup
 
-Use this skill for one conversation file at a time. The goal is to reduce the
-stored JSONL history on disk while preserving the conversation's recoverable
-structure and recent meaning. Do not claim that changing the file will shrink a
-context already loaded into a running request.
+Use this skill for one conversation file at a time. It reduces stored JSONL
+history on disk while preserving recoverable structure and recent meaning. It
+does not shrink a context already loaded into a running request.
 
 ## Hard Safety Rules
 
-- Require a concrete target: an absolute `.jsonl` path, a session ID, or a
+- Require one concrete target: an absolute `.jsonl` path, a session ID, or a
   conversation name. Resolve names through `session_index.jsonl`; if the match
   is not unique, show the candidates and stop.
 - Never touch `session_index.jsonl`, `state_*.sqlite`, `logs_*.sqlite`, WAL/SHM
   files, lock files, or a file that has a writer lock.
-- Treat every run as `inspect -> plan -> audit -> user confirmation -> apply`.
-  The first three stages are read-only. Do not apply a plan merely because a
-  user previously approved a general strategy.
-- Bind a plan and audit to the source SHA-256. If the source, candidate, plan,
-  or audit changes, discard the approval and regenerate.
+- Never edit the active runtime context. The source of truth for this skill is
+  the selected JSONL file on disk.
+- Use this workflow exactly:
+  `inspect -> intent profile -> plan-set or candidate plans -> independent audit
+  -> user selects exact candidate -> apply`.
+- Do not treat approval of a general strategy as approval of a plan. Require
+  the exact current `plan_id` for `apply`.
+- Bind every plan and audit to source, candidate, plan, and audit digests. If
+  any bound artifact changes, regenerate it and obtain a new confirmation.
 - Before replacement, create and hash-check a byte-for-byte original backup.
-  Write a same-volume temporary file and replace atomically. On any failure,
-  restore the original backup and report the failure.
-- Keep failed or unknown backup batches. Never delete the last successful
-  recovery point without explicit user choice.
+  Replace through a same-volume temporary file and verify the final hash.
+- Keep failed, unknown, corrupt, invalid, and unverifiable backup batches.
+  Never delete the last successful recovery point without explicit user choice.
 
 ## Workflow
 
 ### 1. Resolve and inspect
 
-Run the standard-library helper from this skill directory:
+Run the bundled standard-library helper:
 
 ```powershell
 python scripts/session_cleanup.py inspect "<path-or-session-id-or-name>" `
@@ -41,155 +43,195 @@ python scripts/session_cleanup.py inspect "<path-or-session-id-or-name>" `
 
 For a session ID or name, add `--codex-home "<Codex home>"` when the default
 `%USERPROFILE%\.codex` is not correct. Report the absolute target path, file
-size, record count, time range, latest compaction line, visible-message count,
-tool-output/image sizes, malformed lines, call/result pairing, locks, and the
-fact that this is disk history rather than active context.
+size, record count, time range, logical compaction boundaries, visible-message
+count, tool-output/image sizes, malformed lines, call/result pairing, locks,
+and the fact that this is disk history rather than active context.
 
-Do not proceed if JSONL parsing fails, a writer lock exists, the target is not a
-regular file, or the target is ambiguous.
+Stop if parsing fails, a writer lock exists, the target is not a regular file,
+or the target is ambiguous.
 
-### 2. Generate an adaptive plan
+### 2. Build the intent profile and candidates
+
+Use the inspection metrics and the user's request to record:
+
+- `problem`: `image_cache`, `oversized_output`, `overall_size`, or
+  `context_pressure`;
+- `retention_priority`: `recent_content`, `visible_messages`, `user_images`,
+  or `structural_fidelity`;
+- `allowed_strength`: `cache`, `balanced`, or `space`;
+- optional `target_bytes`;
+- explicit assumptions and the inspection evidence supporting them.
+
+Show this intent profile to the user. If the user did not specify a strength,
+use `balanced` as the default recommendation, but generate all three named
+candidates so the user can compare them. Do not silently turn an inferred
+intent into destructive permission.
+
+The default command is:
 
 ```powershell
 python scripts/session_cleanup.py plan "<same-target>" `
   --report-dir "<report-directory>"
 ```
 
-The command writes a plan JSON, an unreviewed candidate JSONL, and prints the
-plan. Explain the exact changed line numbers, call IDs, original/candidate
-sizes, expected savings, image count, truncation count, and risk.
+With no `--profile` and no manual threshold, this creates a `plan-set` with
+independent candidates for `cache`, `balanced`, and `space`. Each candidate
+has its own `plan_id`, candidate JSONL, plan JSON, and later audit JSON. The
+plan-set itself is an index and comparison document; it is never accepted by
+`apply`.
 
-Use `--recent-compactions 2` when the user requests the latest two logical
-compaction boundaries. Codex normally writes `compacted` and then
-`context_compacted` for one event. The plan records the selected boundary
-lines, and each audit recomputes them from the source file.
+The named profiles are:
 
-The default plan is deliberately conservative:
+| Profile | Transformation |
+| --- | --- |
+| `cache` | Scrub old tool-output `data:image...` caches only; do not truncate text outputs. |
+| `balanced` | Scrub old tool-output image caches and truncate still-large old outputs over 64 KiB, retaining an 8 KiB prefix and 4 KiB suffix. |
+| `space` | Scrub old tool-output image caches and truncate still-large old outputs over 16 KiB, retaining a 2 KiB prefix and 1 KiB suffix. |
+| `custom` | Use explicit `--max-output-bytes`, `--prefix-bytes`, and `--suffix-bytes`; image-cache scrubbing remains enabled. |
+| `target` | Use `--target-bytes`; deterministically choose the least strong threshold that reaches the requested complete-file size. |
 
-**Always preserve**
+`cache`, `balanced`, and `space` are the only profiles in a plan-set.
+Generate `custom` or `target` as one explicit candidate with `--profile`.
+For `target`, the helper compares the named `space` and `balanced` policies,
+then scans 16 KiB through 64 KiB on a 1 KiB grid and selects the largest
+threshold whose candidate is at or below the target. A target below the
+`space` result is `infeasible`; a source already within the target is
+`no_change`. Neither status may be applied.
 
-- Every record from the latest logical `compacted`/`context_compacted` boundary
-  onward by default. Use `--recent-compactions N` to preserve from the N most
-  recent logical boundaries. If there is no compaction boundary, preserve the
-  recent tail fallback.
-- All user and assistant visible messages, byte-for-byte.
-- `session_meta`, compaction records, turn/event records, reasoning, token
-  counts, patches, tool calls, call IDs, and any record not confidently known
-  to be an old tool output.
-- Images inside user messages.
-- Unknown fields and record types.
+The default `recent_compactions` is `2`. Preserve records from the two most
+recent logical `compacted`/`context_compacted` boundaries onward. If fewer
+boundaries exist, use the available boundaries and the recent-record fallback
+(default `1000`). The plan and every audit record the selected boundary lines.
 
-**Candidate changes**
+### 3. Enforce the transformation boundary
 
-- Only old `custom_tool_call_output` or `function_call_output` records.
-- Replace structured `input_image` nodes whose URL is a `data:image...` cache
-  with a text marker while retaining the surrounding record structure.
-- For an old tool output still over 64 KiB, replace its output payload with a
-  text preview containing a bounded prefix, suffix, and
-  `[older tool output middle truncated]` marker.
-- Never delete a complete record, delete by age alone, summarize messages,
-  remove old user/assistant content, or clear user-message images by default.
+Always preserve:
 
-If the plan would alter anything outside these rules, mark it blocked and do
-not invent a workaround. A future policy can be added only as an explicit,
-separately reviewed strategy.
+- every record in the protected recent region;
+- all user and assistant visible messages byte-for-byte;
+- `session_meta`, compaction records, events, reasoning, token counts, patches,
+  tool calls, call IDs, unknown fields, and unknown record types;
+- images embedded in user messages.
 
-### 3. Run multi-stage audits
+Candidate changes are limited to old `custom_tool_call_output` and
+`function_call_output` records outside the protected region:
+
+- replace structured `input_image` nodes containing `data:image...` cache data
+  with a text marker while retaining the surrounding record structure;
+- for an old output above the selected threshold, retain a bounded prefix and
+  suffix with a middle truncation marker.
+
+Never delete a complete record, delete by age alone, summarize visible
+messages, remove old user/assistant content, or clear user-message images. If a
+plan proposes anything else, mark it blocked and regenerate under an explicit
+reviewed policy.
+
+### 4. Run independent audits
+
+Audit either a single candidate or the plan-set:
 
 ```powershell
-python scripts/session_cleanup.py audit "<plan-json>"
+python scripts/session_cleanup.py audit "<plan-or-plan-set-json>"
 ```
 
-Treat the audit as a fresh review, not as confirmation of the plan generator.
-It runs four named stages. Each stage rereads the source/candidate snapshots,
-records an input digest and result digest, and must pass independently:
+For a plan-set, the command independently audits every candidate, writes each
+candidate audit, and updates the plan-set audit metadata. For one candidate it
+writes one audit document. The four named stages are:
 
-- source and candidate hashes still match the plan;
-- both files parse line-by-line as UTF-8 JSONL objects;
-- record count, session ID, visible-message lines, compaction records, tool
-  calls, and call/result ID sequences are unchanged;
-- every changed line is an allowed old tool-output line;
-- the protected region is byte-for-byte unchanged;
-- old tool-output image nodes are gone and no unexpected image node was added.
+1. `schema`: source and candidate are valid UTF-8 JSONL objects;
+2. `policy`: only allowed old tool-output lines changed and protected content
+   is unchanged;
+3. `deterministic_transform`: the candidate is reproducible from the source,
+   policy, and intent metadata;
+4. `integrity`: record count, session ID, visible-message lines, compaction
+   records, tool call/result ID sequences, and image constraints remain valid.
 
-The `apply` command runs the same four stage functions again and compares their
-results with the stored audit. A missing, reordered, tampered, or stale stage
-invalidates the plan. The stages are repeatable checks in one command, not
-separate processes.
+Each stage records input and result digests. `apply` reruns the same stages and
+rejects missing, reordered, stale, or tampered results. An audit failure
+invalidates the plan; do not edit a candidate to force a pass.
 
-Then perform a human-facing risk review of the printed `changed_lines` list:
-every line must have a clear reason, bounded impact, and expected savings. An
-audit failure invalidates the plan. Do not edit the candidate to make an audit
-pass; regenerate the plan instead.
+### 5. Show, select, and apply
 
-### 4. Show the plan and wait for confirmation
+Show the user the intent profile and, for every candidate:
 
-Show the user:
+- profile, exact `plan_id`, status, source SHA-256, and audit status;
+- original/candidate sizes, expected savings, changed record count, cleared
+  image count, and truncation count;
+- every changed line and call ID, or a clearly labeled complete list plus counts;
+- protected content categories, backup location, restore command, and residual
+  risk;
+- target selection details, including `infeasible` or `no_change` reasons.
 
-- target path, session ID, source SHA-256, and plan ID;
-- original size, candidate size, expected savings, and changed record count;
-- every changed line/call ID and reason, or a clearly labeled full list plus
-  counts when the list is long;
-- exact protected content categories;
-- backup location and restore command;
-- the fact that active context is unchanged;
-- any residual risk.
-
-Ask for explicit confirmation containing the plan ID. Silence, a vague
-approval, or an approval of an earlier version is insufficient unless the exact
-plan ID is supplied.
-
-### 5. Apply only the reviewed plan
+The user must select one exact candidate and confirm its current `plan_id`.
+Never pass the `plan_set_id` to `apply`, and never apply multiple candidates.
 
 ```powershell
-python scripts/session_cleanup.py apply "<plan-json>" `
-  --confirm "<plan-id>" `
+python scripts/session_cleanup.py apply "<candidate-plan-json>" `
+  --confirm "<candidate-plan-id>" `
   --backup-root "<backup-root>"
 ```
 
-The helper rechecks the source hash and lock state, verifies the independent
-audit, creates the original backup, performs an atomic same-volume replace,
-and verifies the final candidate hash. Report the backup ID, backup path, final
-hash, and post-write status. Never silently retry against a changed source.
+The helper rechecks the source hash and writer lock, verifies the stored audit
+against a fresh audit, creates the original backup, performs an atomic
+same-volume replace, and verifies the final candidate hash. Report the backup
+ID, backup path, final hash, and post-write status. Never silently retry against
+a changed source.
+
+Plans with `plan_version: 2` or any older version are stale and must be
+regenerated.
 
 ### 6. Manage and restore backups
 
-List backups without changing anything. The output includes an integrity value
-for successful batches; only `integrity: valid` batches can become prune
-candidates:
+List backups without changing anything:
 
 ```powershell
 python scripts/session_cleanup.py backups list `
-  --backup-root "<backup-root>" --session-id "<session-id>"
+  --backup-root "<backup-root>" --session-id "<session-id>" `
+  --older-than-days 2
 ```
 
-Preview removal of successful backups while keeping the newest two:
+Use `backups cleanup` for the normal preview-and-delete workflow. Keep the
+newest two verifiable successful backups by default:
 
 ```powershell
-python scripts/session_cleanup.py backups prune `
-  --backup-root "<backup-root>" --session-id "<session-id>" --keep 2
+python scripts/session_cleanup.py backups cleanup `
+  --backup-root "<backup-root>" --session-id "<session-id>" `
+  --keep 2 --older-than-days 2
 ```
 
-Only after reviewing that preview, run the command again with
-`--confirm "<preview-id>"`. The preview ID binds confirmation to the exact
-backup set the user reviewed; if the set changes, create a new preview. Failed
-and unknown batches are retained and are never included in automatic prune
-candidates.
+The preview includes `preview_id`, exact deletion paths, reclaimable bytes,
+retained paths, preservation reasons, and a complete backup snapshot. Only
+after the user reviews it, confirm the same preview:
 
-Restore a successful batch explicitly:
+```powershell
+python scripts/session_cleanup.py backups cleanup `
+  --backup-root "<backup-root>" --session-id "<session-id>" `
+  --keep 2 --older-than-days 2 --confirm "<preview-id>"
+```
+
+`backups prune` is a compatibility alias for the same implementation. The
+confirmation is bound to preview version, digest, age filter, and the complete
+backup snapshot. If anything changes, generate a new preview. Failed, unknown,
+invalid, corrupt, symlinked, and invalid-timestamp backups are never automatic
+deletion targets. Candidates are rechecked and moved into quarantine before
+recursive deletion.
+
+Restore only to the original source path recorded in the manifest:
 
 ```powershell
 python scripts/session_cleanup.py restore "<backup-directory>" `
   --confirm "<backup-id>"
 ```
 
-Verify the restored SHA-256 and parseability before reporting success.
+The helper verifies the backup digest, SHA-256, JSONL parseability, target lock,
+and post-restore hash. A restore target cannot be redirected to another
+conversation.
 
 ## Helper Contract
 
-The single bundled `scripts/session_cleanup.py` uses only Python's standard
-library and exposes these subcommands: `inspect`, `plan`, `audit`, `apply`,
-`backups list`, `backups prune`, and `restore`. JSON reports are the durable
+The bundled `scripts/session_cleanup.py` uses only Python's standard library
+and exposes `inspect`, `plan`, `audit`, `apply`, `backups list`,
+`backups cleanup`, `backups prune`, and `restore`. JSON reports are the durable
 interface; console output is for the user. Exit code `0` means success, `1`
 means an audit failed, and `2` means an operational or validation error.
 
