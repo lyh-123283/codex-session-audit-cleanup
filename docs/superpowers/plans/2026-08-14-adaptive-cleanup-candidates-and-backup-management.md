@@ -260,7 +260,7 @@ Expected: all tests pass, including existing single-plan audit/apply tests updat
         plan = self._make_target_plan(target_bytes=80 * 1024)
         self.assertEqual(plan["policy"]["profile"], "custom")
         self.assertEqual(plan["target"]["target_bytes"], 80 * 1024)
-        self.assertEqual(plan["target"]["selection_method"], "binary_search_between_balanced_and_space")
+    self.assertEqual(plan["target"]["selection_method"], "deterministic_scan_between_balanced_and_space")
         first = (
             plan["policy"]["max_output_bytes"],
             plan["policy"]["prefix_bytes"],
@@ -291,14 +291,14 @@ Expected: all tests pass, including existing single-plan audit/apply tests updat
 
 Expected: FAIL because target metadata and policy selection do not exist.
 
-- [ ] Step 3: Implement deterministic selection. Add resolve_plan_profile(profile, target_bytes=None, max_output_bytes=None, prefix_bytes=None, suffix_bytes=None) as the single entry point for target/custom validation. Produce balanced and space candidate sizes from the same source and boundary. If the source already satisfies the target, return status no_change. If the target is below the space result, return status infeasible and set remaining_protected_bytes to the size of the space candidate plus all unchanged protected bytes. Otherwise binary-search the integer output threshold between 16 KiB and 64 KiB, using fixed preview interpolation:
+- [ ] Step 3: Implement deterministic selection. Add resolve_plan_profile(profile, target_bytes=None, max_output_bytes=None, prefix_bytes=None, suffix_bytes=None) as the single entry point for target/custom validation. Produce balanced and space candidate sizes from the same source and boundary. If the source already satisfies the target, return status no_change. If the target is below the space result, return status infeasible and set remaining_protected_bytes to the size of the space candidate plus all unchanged protected bytes. Otherwise evaluate the deterministic 1 KiB threshold grid from 16 KiB through 64 KiB, using fixed preview interpolation, and select the largest threshold whose actual candidate is at or below the target:
 
     def interpolate_preview_bytes(max_output_bytes):
         prefix_bytes = min(8 * 1024, max(1, max_output_bytes // 2))
         suffix_bytes = min(4 * 1024, max(1, max_output_bytes - prefix_bytes - 1))
         return prefix_bytes, suffix_bytes
 
-At each search step call the same pure transform used by audit, retain the smallest threshold whose candidate size is at most target_bytes, and record selection_method binary_search_between_balanced_and_space. Do not modify protected records to satisfy a target.
+At each grid step call the same pure transform used by audit, retain the largest threshold whose candidate size is at most target_bytes, and record selection_method deterministic_scan_between_balanced_and_space. This finite scan does not assume candidate-size monotonicity. Do not modify protected records to satisfy a target.
 
 - [ ] Step 4: Bind target metadata to audit and apply. Include the complete target object in the plan digest, compare it during deterministic audit, and make apply_plan reject a target plan whose selected policy, target bytes, or source size differs. Infeasible plans print a reason and never create a candidate that apply can accept.
 

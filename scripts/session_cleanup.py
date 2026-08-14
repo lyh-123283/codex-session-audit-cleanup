@@ -241,12 +241,32 @@ def compact_json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def decode_utf8_prefix(data: bytes, limit: int) -> str:
+    fragment = data[:limit]
+    while fragment:
+        try:
+            return fragment.decode("utf-8")
+        except UnicodeDecodeError as error:
+            fragment = fragment[:error.start]
+    return ""
+
+
+def decode_utf8_suffix(data: bytes, limit: int) -> str:
+    fragment = data[-limit:] if limit else b""
+    while fragment:
+        try:
+            return fragment.decode("utf-8")
+        except UnicodeDecodeError as error:
+            fragment = fragment[error.end:]
+    return ""
+
+
 def truncate_output(value: Any, max_bytes: int, prefix_bytes: int, suffix_bytes: int) -> tuple[Any, bool]:
     encoded = compact_json_bytes(value)
     if len(encoded) <= max_bytes:
         return value, False
-    prefix = encoded[:prefix_bytes].decode("utf-8", errors="replace") if prefix_bytes else ""
-    suffix = encoded[-suffix_bytes:].decode("utf-8", errors="replace") if suffix_bytes else ""
+    prefix = decode_utf8_prefix(encoded, prefix_bytes) if prefix_bytes else ""
+    suffix = decode_utf8_suffix(encoded, suffix_bytes) if suffix_bytes else ""
     text = prefix + "\n[older tool output middle truncated]\n" + suffix
     if isinstance(value, list):
         return [{"type": "input_text", "text": text}], True
@@ -555,6 +575,149 @@ def validate_plan_policy(plan: dict[str, Any]) -> list[str]:
     return errors
 
 
+def resolve_plan_profile(
+    profile: str = "balanced",
+    *,
+    target_bytes: int | None = None,
+    max_output_bytes: int | None = None,
+    prefix_bytes: int | None = None,
+    suffix_bytes: int | None = None,
+) -> dict[str, Any]:
+    if profile == "target":
+        if target_bytes is None or isinstance(target_bytes, bool) or target_bytes < 1:
+            raise ValueError("target profile requires target_bytes of at least 1")
+        if any(value is not None for value in (max_output_bytes, prefix_bytes, suffix_bytes)):
+            raise ValueError("target profile cannot be combined with manual output thresholds")
+        return {"profile": "target", "target_bytes": target_bytes}
+    if target_bytes is not None:
+        raise ValueError("target_bytes requires profile=target")
+    return resolve_profile_policy(
+        profile,
+        max_output_bytes,
+        prefix_bytes,
+        suffix_bytes,
+    )
+
+
+def interpolate_preview_bytes(max_output_bytes: int) -> tuple[int, int]:
+    minimum = 16 * 1024
+    maximum = 64 * 1024
+    if max_output_bytes < minimum or max_output_bytes > maximum:
+        raise ValueError("target interpolation threshold must be between space and balanced")
+    span = maximum - minimum
+    prefix_bytes = 2 * 1024 + ((max_output_bytes - minimum) * (8 * 1024 - 2 * 1024) // span)
+    suffix_bytes = 1 * 1024 + ((max_output_bytes - minimum) * (4 * 1024 - 1 * 1024) // span)
+    if prefix_bytes + suffix_bytes >= max_output_bytes:
+        suffix_bytes = max(1, max_output_bytes - prefix_bytes - 1)
+    return prefix_bytes, suffix_bytes
+
+
+def select_target_policy(
+    records: list[dict[str, Any]],
+    raw_lines: list[bytes],
+    protected_from: int,
+    target_bytes: int,
+) -> dict[str, Any]:
+    if not isinstance(target_bytes, int) or isinstance(target_bytes, bool) or target_bytes < 1:
+        raise ValueError("target_bytes must be at least 1")
+
+    def render(policy: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        transformed = transform_lines(records, raw_lines, protected_from, policy=policy)
+        return len(b"".join(transformed["candidate_lines"])), transformed
+
+    source_bytes = sum(len(line) for line in raw_lines)
+    balanced_policy = resolve_profile_policy("balanced")
+    space_policy = resolve_profile_policy("space")
+    balanced_bytes, balanced_transform = render(balanced_policy)
+    space_bytes, space_transform = render(space_policy)
+    base_target = {
+        "target_bytes": target_bytes,
+        "lower_profile": "space",
+        "upper_profile": "balanced",
+        "balanced_candidate_bytes": balanced_bytes,
+        "space_candidate_bytes": space_bytes,
+        "source_bytes": source_bytes,
+        "remaining_protected_bytes": 0,
+    }
+    if source_bytes <= target_bytes:
+        return {
+            "status": "no_change",
+            "policy": balanced_policy,
+            "transformation": balanced_transform,
+            "target": {
+                **base_target,
+                "selection_method": "source_already_within_target",
+                "selected_max_output_bytes": balanced_policy["max_output_bytes"],
+            },
+        }
+    if target_bytes < space_bytes:
+        return {
+            "status": "infeasible",
+            "policy": space_policy,
+            "transformation": space_transform,
+            "target": {
+                **base_target,
+                "selection_method": "space_profile_is_strongest_named_policy",
+                "selected_max_output_bytes": space_policy["max_output_bytes"],
+                "remaining_protected_bytes": space_bytes - target_bytes,
+            },
+        }
+    if target_bytes >= balanced_bytes:
+        return {
+            "status": "ready_for_review",
+            "policy": balanced_policy,
+            "transformation": balanced_transform,
+            "target": {
+                **base_target,
+                "selection_method": "balanced_profile_satisfies_target",
+                "selected_max_output_bytes": balanced_policy["max_output_bytes"],
+            },
+        }
+
+    low = int(space_policy["max_output_bytes"])
+    high = int(balanced_policy["max_output_bytes"])
+    best: tuple[dict[str, Any], dict[str, Any], int] | None = None
+    thresholds = list(range(low, high + 1, 1024))
+    if thresholds[-1] != high:
+        thresholds.append(high)
+    for threshold in thresholds:
+        prefix_bytes, suffix_bytes = interpolate_preview_bytes(threshold)
+        candidate_policy = {
+            "profile": "custom",
+            "scrub_images": True,
+            "max_output_bytes": threshold,
+            "prefix_bytes": prefix_bytes,
+            "suffix_bytes": suffix_bytes,
+        }
+        candidate_bytes, candidate_transform = render(candidate_policy)
+        if candidate_bytes <= target_bytes:
+            best = (candidate_policy, candidate_transform, candidate_bytes)
+    if best is None:
+        return {
+            "status": "infeasible",
+            "policy": space_policy,
+            "transformation": space_transform,
+            "target": {
+                **base_target,
+                "selection_method": "no_threshold_reached_target",
+                "selected_max_output_bytes": space_policy["max_output_bytes"],
+                "remaining_protected_bytes": space_bytes - target_bytes,
+            },
+        }
+    policy, transformation, candidate_bytes = best
+    return {
+        "status": "ready_for_review",
+        "policy": policy,
+        "transformation": transformation,
+        "target": {
+            **base_target,
+            "selection_method": "deterministic_scan_between_balanced_and_space",
+            "selected_max_output_bytes": policy["max_output_bytes"],
+            "selected_candidate_bytes": candidate_bytes,
+        },
+    }
+
+
 def transform_lines(
     records: list[dict[str, Any]],
     raw_lines: list[bytes],
@@ -800,6 +963,26 @@ def validate_intent_profile(intent_profile: Any) -> list[str]:
     return errors
 
 
+def validate_plan_semantics(plan: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    requested_profile = plan.get("requested_profile")
+    intent = plan.get("intent_profile")
+    target = plan.get("target")
+    intent_target = intent.get("target_bytes") if isinstance(intent, dict) else None
+    if requested_profile == "target":
+        if not isinstance(target, dict):
+            errors.append("target profile requires target metadata")
+        if intent_target is None:
+            errors.append("target profile requires intent_profile.target_bytes")
+        elif isinstance(target, dict) and target.get("target_bytes") != intent_target:
+            errors.append("target metadata does not match intent profile")
+    elif intent_target is not None:
+        errors.append("target_bytes requires requested_profile=target")
+    elif target is not None:
+        errors.append("target metadata requires requested_profile=target")
+    return errors
+
+
 def build_plan(
     source: Path,
     report_dir: Path,
@@ -813,21 +996,21 @@ def build_plan(
     intent_profile: dict[str, Any] | None = None,
     target_bytes: int | None = None,
 ) -> dict[str, Any]:
-    if target_bytes is not None:
-        raise ValueError("target-size mode is not available until an explicit target profile is selected")
     if profile is None:
         profile = "balanced" if all(value is None for value in (max_output_bytes, prefix_bytes, suffix_bytes)) else "custom"
-    policy = resolve_profile_policy(
+    requested_profile = profile
+    requested_policy = resolve_plan_profile(
         profile,
-        max_output_bytes,
-        prefix_bytes,
-        suffix_bytes,
+        target_bytes=target_bytes,
+        max_output_bytes=max_output_bytes,
+        prefix_bytes=prefix_bytes,
+        suffix_bytes=suffix_bytes,
     )
     validate_cleanup_options(
         recent_records,
-        int(policy.get("max_output_bytes") or DEFAULT_MAX_OUTPUT_BYTES),
-        int(policy.get("prefix_bytes") or DEFAULT_PREFIX_BYTES),
-        int(policy.get("suffix_bytes") or DEFAULT_SUFFIX_BYTES),
+        DEFAULT_MAX_OUTPUT_BYTES,
+        DEFAULT_PREFIX_BYTES,
+        DEFAULT_SUFFIX_BYTES,
         recent_compactions,
     )
     source = validate_session_path(source)
@@ -839,6 +1022,21 @@ def build_plan(
     stats = collect_stats(source, records, errors)
     protected_region = boundary_metadata(records, recent_records, recent_compactions)
     protected_from = protected_region["from_line"]
+    target_selection: dict[str, Any] | None = None
+    if requested_profile == "target":
+        target_selection = select_target_policy(records, raw_lines, protected_from, target_bytes or 0)
+        policy = target_selection["policy"]
+        selection_status = target_selection["status"]
+    else:
+        policy = requested_policy
+        selection_status = "ready_for_review"
+    effective_intent = (
+        copy.deepcopy(intent_profile)
+        if intent_profile is not None
+        else build_intent_profile(stats, target_bytes=target_bytes)
+    )
+    if target_bytes is not None and effective_intent.get("target_bytes") != target_bytes:
+        raise ValueError("intent profile target_bytes does not match plan target_bytes")
     plan_id = uuid.uuid4().hex
     candidate = report_dir / f"candidate-{plan_id}.jsonl"
     transformation = write_candidate(
@@ -854,7 +1052,8 @@ def build_plan(
         "plan_version": PLAN_VERSION,
         "plan_id": plan_id,
         "candidate_kind": "session_cleanup",
-        "status": "ready_for_review" if not errors else "blocked",
+        "requested_profile": requested_profile,
+        "status": selection_status if not errors else "blocked",
         "created_at": utc_now(),
         "source": source_fingerprint,
         "candidate": candidate_fingerprint,
@@ -863,8 +1062,9 @@ def build_plan(
         "audit_path": str(report_dir / f"audit-{plan_id}.json"),
         "session_id": stats["session_id"],
         "source_stats": stats,
-        "intent_profile": copy.deepcopy(intent_profile) if intent_profile is not None else build_intent_profile(stats),
+        "intent_profile": effective_intent,
         "policy": policy,
+        "target": target_selection["target"] if target_selection is not None else None,
         "locks": find_locks(source),
         "protected_region": {
             **protected_region,
@@ -901,6 +1101,10 @@ def build_plan(
     if errors or plan["locks"]:
         plan["status"] = "blocked"
         plan["blocking_reasons"] = (["invalid_json"] if errors else []) + (["writer_lock_detected"] if plan["locks"] else [])
+    elif selection_status == "infeasible":
+        plan["blocking_reasons"] = ["target_size_infeasible"]
+    elif selection_status == "no_change":
+        plan["blocking_reasons"] = ["target_already_satisfied"]
     plan["plan_digest"] = self_digest(plan, "plan_digest")
     write_json(Path(plan["report_path"]), plan)
     return plan
@@ -1258,6 +1462,25 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
                     policy.get("prefix_bytes"),
                     policy.get("suffix_bytes"),
                 )
+        if plan.get("requested_profile") == "target":
+            target = plan.get("target")
+            if not isinstance(target, dict):
+                raise ValueError("target metadata is missing")
+            target_bytes = target.get("target_bytes")
+            if plan.get("intent_profile", {}).get("target_bytes") != target_bytes:
+                errors.append("target metadata does not match intent profile")
+            selection = select_target_policy(
+                source_records,
+                source_lines,
+                protected_from,
+                int(target_bytes),
+            )
+            if selection["status"] != plan.get("status"):
+                errors.append("target selection status changed")
+            if selection["policy"] != plan.get("policy"):
+                errors.append("target policy changed since plan generation")
+            if selection["target"] != target:
+                errors.append("target metadata changed since plan generation")
         region = plan.get("protected_region", {})
         recent_records = int(region.get("fallback_recent_records", DEFAULT_RECENT_RECORDS))
         recent_compactions = int(
@@ -1373,10 +1596,11 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
     candidate = Path(plan["candidate_path"]).expanduser().resolve()
     plan_errors: list[str] = []
     plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
+    plan_errors.extend(validate_plan_semantics(plan))
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
         plan_errors.append("plan digest changed")
-    if plan.get("status") == "blocked":
-        plan_errors.append("plan is blocked")
+    if plan.get("status") != "ready_for_review":
+        plan_errors.append("plan is not ready for review")
     stage_results = build_audit_stages(source, candidate, plan)
     errors: list[str] = []
     for error in [*plan_errors, *(error for stage in stage_results for error in stage["errors"])]:
@@ -1580,6 +1804,11 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     intent_errors = validate_intent_profile(plan.get("intent_profile"))
     if intent_errors:
         raise ValueError("invalid intent profile: " + "; ".join(intent_errors))
+    semantic_errors = validate_plan_semantics(plan)
+    if semantic_errors:
+        raise ValueError("invalid cleanup plan semantics: " + "; ".join(semantic_errors))
+    if plan.get("status") != "ready_for_review":
+        raise ValueError("plan is not ready for review")
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
         raise ValueError("plan digest changed after audit; regenerate the plan")
     if confirmation != plan.get("plan_id"):

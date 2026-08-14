@@ -71,6 +71,7 @@ def make_session(path):
                 },
             },
         )
+
         write_record(
             handle,
             {
@@ -103,6 +104,32 @@ def make_session(path):
         )
 
 
+def make_target_session(path):
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        write_record(handle, {"type": "session_meta", "payload": {"id": "target-session"}})
+        for index in range(4):
+            call_id = f"target-call-{index}"
+            write_record(
+                handle,
+                {
+                    "type": "response_item",
+                    "payload": {"type": "custom_tool_call", "call_id": call_id},
+                },
+            )
+            write_record(
+                handle,
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": [{"type": "input_text", "text": "x" * 100000}],
+                    },
+                },
+            )
+        write_record(handle, {"type": "compacted", "payload": {"summary": "target boundary"}})
+
+
 class SessionCleanupTests(unittest.TestCase):
     def test_profiles_have_expected_thresholds(self):
         self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)
@@ -117,6 +144,16 @@ class SessionCleanupTests(unittest.TestCase):
     def test_named_profile_rejects_manual_thresholds(self):
         with self.assertRaises(ValueError):
             session_cleanup.resolve_profile_policy("balanced", 4096, None, None)
+
+    def test_truncate_output_keeps_utf8_boundaries(self):
+        value = [{"type": "input_text", "text": "中文内容" * 500}]
+
+        truncated, did_truncate = session_cleanup.truncate_output(value, 1024, 31, 29)
+
+        self.assertTrue(did_truncate)
+        encoded = json.dumps(truncated, ensure_ascii=False).encode("utf-8")
+        self.assertNotIn(b"\xef\xbf\xbd", encoded)
+        self.assertIn(b"[older tool output middle truncated]", encoded)
 
     def test_cache_profile_clears_old_tool_images_without_text_truncation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -282,6 +319,89 @@ class SessionCleanupTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 apply_plan(Path(plan["report_path"]), plan["plan_id"], root / "backups")
+
+    def test_target_between_profiles_uses_deterministic_custom_threshold(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "target.jsonl"
+            make_target_session(source)
+            balanced = build_plan(source, root / "balanced", profile="balanced")
+            space = build_plan(source, root / "space", profile="space")
+            target_bytes = (balanced["summary"]["candidate_bytes"] + space["summary"]["candidate_bytes"]) // 2
+
+            plan = build_plan(
+                source,
+                root / "target-plan",
+                profile="target",
+                target_bytes=target_bytes,
+            )
+            repeated = build_plan(
+                source,
+                root / "target-plan-repeat",
+                profile="target",
+                target_bytes=target_bytes,
+            )
+
+            self.assertEqual(plan["status"], "ready_for_review")
+            self.assertEqual(plan["policy"]["profile"], "custom")
+            self.assertEqual(plan["target"]["target_bytes"], target_bytes)
+            self.assertEqual(
+                plan["target"]["selection_method"],
+                "deterministic_scan_between_balanced_and_space",
+            )
+            self.assertEqual(
+                (
+                    plan["policy"]["max_output_bytes"],
+                    plan["policy"]["prefix_bytes"],
+                    plan["policy"]["suffix_bytes"],
+                ),
+                (
+                    repeated["policy"]["max_output_bytes"],
+                    repeated["policy"]["prefix_bytes"],
+                    repeated["policy"]["suffix_bytes"],
+                ),
+            )
+            self.assertLessEqual(plan["summary"]["candidate_bytes"], target_bytes)
+            audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(audit["status"], "pass")
+
+            plan["requested_profile"] = "balanced"
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+            downgraded_audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(downgraded_audit["status"], "fail")
+            self.assertTrue(any("target" in error for error in downgraded_audit["errors"]))
+
+            plan["requested_profile"] = "target"
+            plan["target"]["target_bytes"] += 1
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+            tampered_audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(tampered_audit["status"], "fail")
+            self.assertTrue(any("target" in error for error in tampered_audit["errors"]))
+
+    def test_target_below_space_floor_is_infeasible(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "target.jsonl"
+            make_target_session(source)
+
+            plan = build_plan(source, root / "reports", profile="target", target_bytes=1)
+
+            self.assertEqual(plan["status"], "infeasible")
+            self.assertGreater(plan["target"]["remaining_protected_bytes"], 0)
+
+    def test_target_mode_requires_explicit_target_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "target.jsonl"
+            make_target_session(source)
+
+            with self.assertRaises(ValueError):
+                build_plan(source, Path(temp_dir) / "reports", profile="balanced", target_bytes=1000)
 
     def test_recent_compactions_preserves_from_second_latest_logical_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
