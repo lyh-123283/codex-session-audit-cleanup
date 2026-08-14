@@ -104,6 +104,74 @@ def make_session(path):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_profiles_have_expected_thresholds(self):
+        self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)
+        self.assertIsNone(session_cleanup.PROFILE_POLICIES["cache"]["max_output_bytes"])
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["balanced"]["max_output_bytes"], 64 * 1024)
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["balanced"]["prefix_bytes"], 8 * 1024)
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["balanced"]["suffix_bytes"], 4 * 1024)
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["max_output_bytes"], 16 * 1024)
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["prefix_bytes"], 2 * 1024)
+        self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["suffix_bytes"], 1 * 1024)
+
+    def test_named_profile_rejects_manual_thresholds(self):
+        with self.assertRaises(ValueError):
+            session_cleanup.resolve_profile_policy("balanced", 4096, None, None)
+
+    def test_cache_profile_clears_old_tool_images_without_text_truncation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "session.jsonl"
+            make_session(source)
+            records, raw_lines, errors = session_cleanup.parse_jsonl(source)
+            self.assertEqual(errors, [])
+
+            transformed = session_cleanup.transform_lines(
+                records,
+                raw_lines,
+                protected_from=7,
+                policy=session_cleanup.resolve_profile_policy("cache"),
+            )
+            candidate = b"".join(transformed["candidate_lines"])
+
+            self.assertEqual(transformed["image_payloads_cleared"], 1)
+            self.assertEqual(transformed["truncated_outputs"], 0)
+            self.assertIn(b"[image cache cleared]", candidate)
+            self.assertIn(b"x" * 70000, candidate)
+
+    def test_audit_rejects_missing_policy_metadata_in_plan_v3(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan = build_plan(source, root / "reports")
+            plan.pop("policy")
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+
+            audit = audit_plan(Path(plan["report_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("policy metadata" in error for error in audit["errors"]))
+
+    def test_audit_rejects_policy_mismatch_between_plan_sections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan = build_plan(source, root / "reports")
+            plan["transformation"]["policy"] = session_cleanup.PROFILE_POLICIES["space"]
+            plan["plan_digest"] = self_digest(plan, "plan_digest")
+            Path(plan["report_path"]).write_text(
+                json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+            )
+
+            audit = audit_plan(Path(plan["report_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("policy metadata" in error for error in audit["errors"]))
+
     def test_recent_compactions_preserves_from_second_latest_logical_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

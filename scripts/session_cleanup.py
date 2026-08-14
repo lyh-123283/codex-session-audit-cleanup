@@ -21,11 +21,34 @@ TOOL_CALL_TYPES = {"custom_tool_call", "function_call"}
 TOOL_OUTPUT_TYPES = {"custom_tool_call_output", "function_call_output"}
 VISIBLE_MESSAGE_TYPES = {"user_message", "agent_message"}
 DEFAULT_RECENT_RECORDS = 1000
-DEFAULT_RECENT_COMPACTIONS = 1
+DEFAULT_RECENT_COMPACTIONS = 2
 DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_PREFIX_BYTES = 8 * 1024
 DEFAULT_SUFFIX_BYTES = 4 * 1024
-PLAN_VERSION = 2
+PLAN_VERSION = 3
+PROFILE_POLICIES = {
+    "cache": {
+        "profile": "cache",
+        "scrub_images": True,
+        "max_output_bytes": None,
+        "prefix_bytes": None,
+        "suffix_bytes": None,
+    },
+    "balanced": {
+        "profile": "balanced",
+        "scrub_images": True,
+        "max_output_bytes": DEFAULT_MAX_OUTPUT_BYTES,
+        "prefix_bytes": DEFAULT_PREFIX_BYTES,
+        "suffix_bytes": DEFAULT_SUFFIX_BYTES,
+    },
+    "space": {
+        "profile": "space",
+        "scrub_images": True,
+        "max_output_bytes": 16 * 1024,
+        "prefix_bytes": 2 * 1024,
+        "suffix_bytes": 1 * 1024,
+    },
+}
 AUDIT_STAGE_NAMES = ("schema", "policy", "deterministic_transform", "integrity")
 BACKUP_INTERNAL_DIRS = {".prune-previews", ".prune-quarantine"}
 RESERVED_NAMES = {
@@ -462,14 +485,98 @@ def validate_cleanup_options(
         raise ValueError("prefix_bytes plus suffix_bytes must be less than max_output_bytes")
 
 
+def resolve_profile_policy(
+    profile: str = "balanced",
+    max_output_bytes: int | None = None,
+    prefix_bytes: int | None = None,
+    suffix_bytes: int | None = None,
+) -> dict[str, Any]:
+    if profile in PROFILE_POLICIES:
+        if any(value is not None for value in (max_output_bytes, prefix_bytes, suffix_bytes)):
+            raise ValueError("manual output thresholds require profile=custom")
+        return dict(PROFILE_POLICIES[profile])
+    if profile != "custom":
+        raise ValueError("invalid profile: expected cache, balanced, space, or custom")
+    max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES if max_output_bytes is None else max_output_bytes
+    prefix_bytes = DEFAULT_PREFIX_BYTES if prefix_bytes is None else prefix_bytes
+    suffix_bytes = DEFAULT_SUFFIX_BYTES if suffix_bytes is None else suffix_bytes
+    validate_cleanup_options(
+        DEFAULT_RECENT_RECORDS,
+        max_output_bytes,
+        prefix_bytes,
+        suffix_bytes,
+    )
+    return {
+        "profile": "custom",
+        "scrub_images": True,
+        "max_output_bytes": max_output_bytes,
+        "prefix_bytes": prefix_bytes,
+        "suffix_bytes": suffix_bytes,
+    }
+
+
+def validate_plan_policy(plan: dict[str, Any]) -> list[str]:
+    policy = plan.get("policy")
+    if not isinstance(policy, dict):
+        return ["policy metadata is missing; regenerate the plan"]
+    transformation = plan.get("transformation")
+    if not isinstance(transformation, dict):
+        return ["transformation metadata is missing; regenerate the plan"]
+    transformation_policy = transformation.get("policy")
+    if not isinstance(transformation_policy, dict):
+        return ["transformation policy metadata is missing; regenerate the plan"]
+    errors: list[str] = []
+    if policy != transformation_policy:
+        errors.append("policy metadata differs between plan sections")
+    profile = policy.get("profile")
+    if profile in PROFILE_POLICIES:
+        if policy != PROFILE_POLICIES[profile]:
+            errors.append("policy metadata does not match the named profile")
+        return errors
+    if profile != "custom":
+        errors.append("invalid policy profile; regenerate the plan")
+        return errors
+    required = {"profile", "scrub_images", "max_output_bytes", "prefix_bytes", "suffix_bytes"}
+    missing = sorted(required - set(policy))
+    if missing:
+        errors.append("custom policy metadata is incomplete: " + ", ".join(missing))
+        return errors
+    if policy.get("scrub_images") is not True:
+        errors.append("custom policy must preserve image-cache scrubbing")
+    try:
+        validate_cleanup_options(
+            DEFAULT_RECENT_RECORDS,
+            int(policy["max_output_bytes"]),
+            int(policy["prefix_bytes"]),
+            int(policy["suffix_bytes"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"invalid custom policy metadata: {exc}")
+    return errors
+
+
 def transform_lines(
     records: list[dict[str, Any]],
     raw_lines: list[bytes],
     protected_from: int,
-    max_output_bytes: int,
-    prefix_bytes: int,
-    suffix_bytes: int,
+    max_output_bytes: int | None = None,
+    prefix_bytes: int | None = None,
+    suffix_bytes: int | None = None,
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if policy is None:
+        policy = resolve_profile_policy(
+            "custom",
+            max_output_bytes,
+            prefix_bytes,
+            suffix_bytes,
+        )
+    elif any(value is not None for value in (max_output_bytes, prefix_bytes, suffix_bytes)):
+        raise ValueError("manual output thresholds cannot be combined with policy")
+    policy = dict(policy)
+    if policy.get("profile") not in PROFILE_POLICIES and policy.get("profile") != "custom":
+        raise ValueError("invalid transformation policy profile")
     changed_lines: list[dict[str, Any]] = []
     candidate_lines: list[bytes] = []
     image_payloads_cleared = 0
@@ -487,10 +594,19 @@ def transform_lines(
         if not isinstance(payload, dict) or "output" not in payload:
             candidate_lines.append(raw_line)
             continue
-        scrubbed_output, image_count = scrub_image_nodes(payload["output"])
-        truncated_output, did_truncate = truncate_output(
-            scrubbed_output, max_output_bytes, prefix_bytes, suffix_bytes
-        )
+        if policy.get("scrub_images"):
+            scrubbed_output, image_count = scrub_image_nodes(payload["output"])
+        else:
+            scrubbed_output, image_count = payload["output"], 0
+        if policy.get("max_output_bytes") is None:
+            truncated_output, did_truncate = scrubbed_output, False
+        else:
+            truncated_output, did_truncate = truncate_output(
+                scrubbed_output,
+                int(policy["max_output_bytes"]),
+                int(policy["prefix_bytes"]),
+                int(policy["suffix_bytes"]),
+            )
         if image_count == 0 and not did_truncate:
             candidate_lines.append(raw_line)
             continue
@@ -524,6 +640,7 @@ def transform_lines(
         "image_payloads_cleared": image_payloads_cleared,
         "truncated_outputs": truncated_outputs,
         "bytes_saved": bytes_saved,
+        "policy": policy,
     }
 
 
@@ -533,9 +650,11 @@ def write_candidate(
     records: list[dict[str, Any]],
     raw_lines: list[bytes],
     protected_from: int,
-    max_output_bytes: int,
-    prefix_bytes: int,
-    suffix_bytes: int,
+    max_output_bytes: int | None = None,
+    prefix_bytes: int | None = None,
+    suffix_bytes: int | None = None,
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     transformed = transform_lines(
         records,
@@ -544,6 +663,7 @@ def write_candidate(
         max_output_bytes,
         prefix_bytes,
         suffix_bytes,
+        policy=policy,
     )
     candidate.parent.mkdir(parents=True, exist_ok=True)
     data = b"".join(transformed["candidate_lines"])
@@ -558,6 +678,7 @@ def write_candidate(
         "image_payloads_cleared": transformed["image_payloads_cleared"],
         "truncated_outputs": transformed["truncated_outputs"],
         "bytes_saved": transformed["bytes_saved"],
+        "policy": transformed["policy"],
         "candidate_bytes": candidate.stat().st_size,
     }
 
@@ -595,21 +716,87 @@ def save_inspection(report: dict[str, Any], report_dir: Path) -> dict[str, Any]:
     return result
 
 
+def build_intent_profile(
+    stats: dict[str, Any],
+    *,
+    problem: str | None = None,
+    retention_priority: str | None = None,
+    allowed_strength: str | None = None,
+    target_bytes: int | None = None,
+) -> dict[str, Any]:
+    valid_problems = {"image_cache", "oversized_output", "overall_size", "context_pressure"}
+    valid_priorities = {"recent_content", "visible_messages", "user_images", "structural_fidelity"}
+    valid_strengths = {"cache", "balanced", "space"}
+    if problem is not None and problem not in valid_problems:
+        raise ValueError("invalid problem")
+    if retention_priority is not None and retention_priority not in valid_priorities:
+        raise ValueError("invalid retention_priority")
+    if allowed_strength is not None and allowed_strength not in valid_strengths:
+        raise ValueError("invalid allowed_strength")
+    if target_bytes is not None and target_bytes < 1:
+        raise ValueError("target_bytes must be at least 1")
+
+    assumptions: list[str] = []
+    if problem is None:
+        if stats.get("image_payload_count", 0):
+            problem = "image_cache"
+        elif stats.get("tool_output_bytes", 0) > DEFAULT_MAX_OUTPUT_BYTES:
+            problem = "oversized_output"
+        else:
+            problem = "overall_size"
+        assumptions.append(f"inferred problem from inspect metrics: {problem}")
+    if retention_priority is None:
+        retention_priority = "recent_content"
+        assumptions.append("preserve recent content as the default retention priority")
+    if allowed_strength is None:
+        allowed_strength = "balanced"
+        assumptions.append("use balanced as the default allowed cleanup strength")
+    evidence = {
+        "record_count": stats.get("record_count", 0),
+        "tool_output_bytes": stats.get("tool_output_bytes", 0),
+        "tool_output_count": stats.get("tool_output_count", 0),
+        "image_payload_count": stats.get("image_payload_count", 0),
+        "user_image_payload_count": stats.get("user_image_payload_count", 0),
+        "logical_compaction_count": stats.get("logical_compaction_count", 0),
+    }
+    return {
+        "problem": problem,
+        "retention_priority": retention_priority,
+        "allowed_strength": allowed_strength,
+        "target_bytes": target_bytes,
+        "assumptions": assumptions,
+        "evidence": evidence,
+    }
+
+
 def build_plan(
     source: Path,
     report_dir: Path,
     *,
     recent_records: int = DEFAULT_RECENT_RECORDS,
     recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
-    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-    prefix_bytes: int = DEFAULT_PREFIX_BYTES,
-    suffix_bytes: int = DEFAULT_SUFFIX_BYTES,
+    max_output_bytes: int | None = None,
+    prefix_bytes: int | None = None,
+    suffix_bytes: int | None = None,
+    profile: str | None = None,
+    intent_profile: dict[str, Any] | None = None,
+    target_bytes: int | None = None,
 ) -> dict[str, Any]:
-    validate_cleanup_options(
-        recent_records,
+    if target_bytes is not None:
+        raise ValueError("target-size mode is not available until an explicit target profile is selected")
+    if profile is None:
+        profile = "balanced" if all(value is None for value in (max_output_bytes, prefix_bytes, suffix_bytes)) else "custom"
+    policy = resolve_profile_policy(
+        profile,
         max_output_bytes,
         prefix_bytes,
         suffix_bytes,
+    )
+    validate_cleanup_options(
+        recent_records,
+        int(policy.get("max_output_bytes") or DEFAULT_MAX_OUTPUT_BYTES),
+        int(policy.get("prefix_bytes") or DEFAULT_PREFIX_BYTES),
+        int(policy.get("suffix_bytes") or DEFAULT_SUFFIX_BYTES),
         recent_compactions,
     )
     source = validate_session_path(source)
@@ -629,14 +816,13 @@ def build_plan(
         records,
         raw_lines,
         protected_from,
-        max_output_bytes,
-        prefix_bytes,
-        suffix_bytes,
+        policy=policy,
     )
     candidate_fingerprint = fingerprint(candidate)
     plan = {
         "plan_version": PLAN_VERSION,
         "plan_id": plan_id,
+        "candidate_kind": "session_cleanup",
         "status": "ready_for_review" if not errors else "blocked",
         "created_at": utc_now(),
         "source": source_fingerprint,
@@ -646,6 +832,8 @@ def build_plan(
         "audit_path": str(report_dir / f"audit-{plan_id}.json"),
         "session_id": stats["session_id"],
         "source_stats": stats,
+        "intent_profile": intent_profile or build_intent_profile(stats),
+        "policy": policy,
         "locks": find_locks(source),
         "protected_region": {
             **protected_region,
@@ -658,9 +846,10 @@ def build_plan(
         },
         "transformation": {
             "old_tool_output_only": True,
-            "max_output_bytes": max_output_bytes,
-            "prefix_bytes": prefix_bytes,
-            "suffix_bytes": suffix_bytes,
+            "max_output_bytes": policy.get("max_output_bytes"),
+            "prefix_bytes": policy.get("prefix_bytes"),
+            "suffix_bytes": policy.get("suffix_bytes"),
+            "policy": policy,
             "changed_lines": transformation["changed_lines"],
         },
         "summary": {
@@ -874,6 +1063,7 @@ def audit_policy_stage(source: Path, candidate: Path, plan: dict[str, Any]) -> d
     source_lines = source_snapshot["lines"]
     candidate_lines = candidate_snapshot["lines"]
     errors: list[str] = []
+    errors.extend(validate_plan_policy(plan))
     changed_lines = {
         item["line"] for item in plan.get("transformation", {}).get("changed_lines", [])
     }
@@ -928,10 +1118,23 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
         source_records, plan
     )
     errors: list[str] = list(boundary_errors)
+    errors.extend(validate_plan_policy(plan))
     try:
-        max_output_bytes = int(options["max_output_bytes"])
-        prefix_bytes = int(options["prefix_bytes"])
-        suffix_bytes = int(options["suffix_bytes"])
+        policy = plan.get("policy")
+        if not isinstance(policy, dict):
+            raise ValueError("policy metadata is missing")
+        else:
+            profile_name = str(policy.get("profile"))
+            if profile_name in PROFILE_POLICIES:
+                resolved_policy = resolve_profile_policy(profile_name)
+                policy = resolved_policy
+            else:
+                policy = resolve_profile_policy(
+                    profile_name,
+                    policy.get("max_output_bytes"),
+                    policy.get("prefix_bytes"),
+                    policy.get("suffix_bytes"),
+                )
         region = plan.get("protected_region", {})
         recent_records = int(region.get("fallback_recent_records", DEFAULT_RECENT_RECORDS))
         recent_compactions = int(
@@ -939,18 +1142,16 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
         )
         validate_cleanup_options(
             recent_records,
-            max_output_bytes,
-            prefix_bytes,
-            suffix_bytes,
+            int(policy.get("max_output_bytes") or DEFAULT_MAX_OUTPUT_BYTES),
+            int(policy.get("prefix_bytes") or DEFAULT_PREFIX_BYTES),
+            int(policy.get("suffix_bytes") or DEFAULT_SUFFIX_BYTES),
             recent_compactions,
         )
         expected = transform_lines(
             source_records,
             source_lines,
             protected_from,
-            max_output_bytes,
-            prefix_bytes,
-            suffix_bytes,
+            policy=policy,
         )
         if expected["candidate_lines"] != candidate_lines:
             errors.append("candidate does not match deterministic transform")
@@ -964,6 +1165,7 @@ def audit_deterministic_stage(source: Path, candidate: Path, plan: dict[str, Any
         "protected_from": protected_from,
         "boundary": expected_boundary,
         "transformation": options,
+        "policy": policy,
     }
     return make_audit_stage(
         "deterministic_transform",
