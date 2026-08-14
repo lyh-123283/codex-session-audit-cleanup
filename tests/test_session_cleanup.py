@@ -172,6 +172,117 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertEqual(audit["status"], "fail")
             self.assertTrue(any("policy metadata" in error for error in audit["errors"]))
 
+    def test_plan_set_has_independent_profiles_and_intent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            result = session_cleanup.build_plan_set(
+                source,
+                root / "reports",
+                profiles=["cache", "balanced", "space"],
+                intent_profile={
+                    "problem": "overall_size",
+                    "retention_priority": "recent_content",
+                    "allowed_strength": "balanced",
+                    "target_bytes": None,
+                    "assumptions": [],
+                    "evidence": {"source": "test"},
+                },
+            )
+
+            self.assertEqual(result["status"], "ready_for_review")
+            self.assertGreaterEqual(len(result["candidates"]), 1)
+            plan_ids = {entry["plan_id"] for entry in result["candidates"]}
+            self.assertEqual(len(plan_ids), len(result["candidates"]))
+            self.assertEqual(
+                {entry["source_sha256"] for entry in result["candidates"]},
+                {result["source"]["sha256"]},
+            )
+            self.assertEqual(
+                {entry["policy"]["profile"] for entry in result["candidates"]},
+                {"cache", "balanced", "space"},
+            )
+            self.assertTrue(Path(result["plan_set_path"]).is_file())
+
+    def test_audit_plan_set_audits_each_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan_set = session_cleanup.build_plan_set(source, root / "reports")
+
+            audit = session_cleanup.audit_plan_set(Path(plan_set["plan_set_path"]))
+
+            self.assertEqual(audit["status"], "pass")
+            self.assertEqual(len(audit["candidate_audits"]), len(plan_set["candidates"]))
+            self.assertTrue(all(item["status"] == "pass" for item in audit["candidate_audits"]))
+
+    def test_apply_rejects_plan_set_and_old_plan_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan_set = session_cleanup.build_plan_set(source, root / "reports")
+
+            with self.assertRaises(ValueError):
+                apply_plan(Path(plan_set["plan_set_path"]), plan_set["plan_set_id"], root / "backups")
+
+            old_plan_path = root / "old-plan.json"
+            old_plan_path.write_text(
+                json.dumps({"plan_version": 2, "plan_id": "old"}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                apply_plan(old_plan_path, "old", root / "backups")
+
+    def test_audit_plan_set_rejects_tampered_index_bindings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan_set = session_cleanup.build_plan_set(source, root / "reports")
+            plan_set["candidates"][0]["source_sha256"] = "0" * 64
+            plan_set["candidates"][0]["audit_path"] = str(root / "wrong-audit.json")
+            plan_set["plan_set_digest"] = self_digest(plan_set, "plan_set_digest")
+            Path(plan_set["plan_set_path"]).write_text(
+                json.dumps(plan_set, ensure_ascii=False), encoding="utf-8"
+            )
+
+            audit = session_cleanup.audit_plan_set(Path(plan_set["plan_set_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("index" in error for error in audit["errors"]))
+
+    def test_audit_plan_set_rejects_duplicate_requested_profile_entries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan_set = session_cleanup.build_plan_set(source, root / "reports")
+            plan_set["requested_profiles"] = ["cache"]
+            plan_set["plan_set_digest"] = self_digest(plan_set, "plan_set_digest")
+            Path(plan_set["plan_set_path"]).write_text(
+                json.dumps(plan_set, ensure_ascii=False), encoding="utf-8"
+            )
+
+            audit = session_cleanup.audit_plan_set(Path(plan_set["plan_set_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("profile" in error for error in audit["errors"]))
+
+    def test_apply_rejects_incomplete_intent_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "session.jsonl"
+            make_session(source)
+            plan = build_plan(source, root / "reports", intent_profile={})
+            audit = audit_plan(Path(plan["report_path"]))
+            self.assertEqual(audit["status"], "fail")
+
+            with self.assertRaises(ValueError):
+                apply_plan(Path(plan["report_path"]), plan["plan_id"], root / "backups")
+
     def test_recent_compactions_preserves_from_second_latest_logical_boundary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

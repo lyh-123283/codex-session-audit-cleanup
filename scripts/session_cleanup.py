@@ -769,6 +769,37 @@ def build_intent_profile(
     }
 
 
+def validate_intent_profile(intent_profile: Any) -> list[str]:
+    if not isinstance(intent_profile, dict):
+        return ["intent profile metadata is missing; regenerate the plan"]
+    required = {
+        "problem",
+        "retention_priority",
+        "allowed_strength",
+        "target_bytes",
+        "assumptions",
+        "evidence",
+    }
+    missing = sorted(required - set(intent_profile))
+    if missing:
+        return ["intent profile is incomplete: " + ", ".join(missing)]
+    errors: list[str] = []
+    if intent_profile["problem"] not in {"image_cache", "oversized_output", "overall_size", "context_pressure"}:
+        errors.append("intent profile problem is invalid")
+    if intent_profile["retention_priority"] not in {"recent_content", "visible_messages", "user_images", "structural_fidelity"}:
+        errors.append("intent profile retention_priority is invalid")
+    if intent_profile["allowed_strength"] not in {"cache", "balanced", "space"}:
+        errors.append("intent profile allowed_strength is invalid")
+    target_bytes = intent_profile["target_bytes"]
+    if target_bytes is not None and (not isinstance(target_bytes, int) or isinstance(target_bytes, bool) or target_bytes < 1):
+        errors.append("intent profile target_bytes is invalid")
+    if not isinstance(intent_profile["assumptions"], list):
+        errors.append("intent profile assumptions must be a list")
+    if not isinstance(intent_profile["evidence"], dict):
+        errors.append("intent profile evidence must be an object")
+    return errors
+
+
 def build_plan(
     source: Path,
     report_dir: Path,
@@ -832,7 +863,7 @@ def build_plan(
         "audit_path": str(report_dir / f"audit-{plan_id}.json"),
         "session_id": stats["session_id"],
         "source_stats": stats,
-        "intent_profile": intent_profile or build_intent_profile(stats),
+        "intent_profile": copy.deepcopy(intent_profile) if intent_profile is not None else build_intent_profile(stats),
         "policy": policy,
         "locks": find_locks(source),
         "protected_region": {
@@ -873,6 +904,98 @@ def build_plan(
     plan["plan_digest"] = self_digest(plan, "plan_digest")
     write_json(Path(plan["report_path"]), plan)
     return plan
+
+
+def build_plan_set(
+    source: Path,
+    report_dir: Path,
+    *,
+    profiles: Iterable[str] = ("cache", "balanced", "space"),
+    intent_profile: dict[str, Any] | None = None,
+    recent_records: int = DEFAULT_RECENT_RECORDS,
+    recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
+) -> dict[str, Any]:
+    source = validate_session_path(source)
+    report_dir = report_dir.expanduser().resolve()
+    profile_list = list(profiles)
+    if not profile_list:
+        raise ValueError("at least one cleanup profile is required")
+    if len(profile_list) != len(set(profile_list)):
+        raise ValueError("cleanup profiles must be unique")
+    for profile in profile_list:
+        if profile not in PROFILE_POLICIES:
+            raise ValueError("plan sets support cache, balanced, and space profiles")
+
+    records, _, errors = parse_jsonl(source)
+    if not records:
+        errors.append({"line": 0, "error": "empty_session"})
+    source_snapshot = fingerprint(source)
+    stats = collect_stats(source, records, errors)
+    resolved_intent = copy.deepcopy(intent_profile) if intent_profile is not None else build_intent_profile(stats)
+    intent_errors = validate_intent_profile(resolved_intent)
+    if intent_errors:
+        raise ValueError("invalid intent profile: " + "; ".join(intent_errors))
+
+    plan_set_id = uuid.uuid4().hex
+    candidates: list[dict[str, Any]] = []
+    blocked = bool(errors)
+    for profile in profile_list:
+        plan = build_plan(
+            source,
+            report_dir,
+            recent_records=recent_records,
+            recent_compactions=recent_compactions,
+            profile=profile,
+            intent_profile=resolved_intent,
+        )
+        plan["plan_set_id"] = plan_set_id
+        plan["plan_digest"] = self_digest(plan, "plan_digest")
+        write_json(Path(plan["report_path"]), plan)
+        if plan["status"] != "ready_for_review":
+            blocked = True
+        if plan["status"] != "ready_for_review" or plan["summary"]["changed_records"] == 0:
+            continue
+        candidates.append(
+            {
+                "plan_id": plan["plan_id"],
+                "plan_path": plan["report_path"],
+                "candidate_path": plan["candidate_path"],
+                "audit_path": plan["audit_path"],
+                "source_sha256": plan["source"]["sha256"],
+                "policy": copy.deepcopy(plan["policy"]),
+                "candidate_bytes": plan["summary"]["candidate_bytes"],
+                "bytes_saved": plan["summary"]["bytes_saved"],
+                "changed_records": plan["summary"]["changed_records"],
+                "image_payloads_cleared": plan["summary"]["image_payloads_cleared"],
+                "truncated_outputs": plan["summary"]["truncated_outputs"],
+                "audit_status": "pending",
+            }
+        )
+
+    if fingerprint(source)["sha256"] != source_snapshot["sha256"]:
+        raise ValueError("source changed while generating candidate plans")
+    plan_set_path = report_dir / f"plan-set-{plan_set_id}.json"
+    if blocked:
+        status = "blocked"
+    elif not candidates:
+        status = "no_change"
+    else:
+        status = "ready_for_review"
+    plan_set = {
+        "plan_set_version": 1,
+        "plan_set_id": plan_set_id,
+        "status": status,
+        "created_at": utc_now(),
+        "source": source_snapshot,
+        "intent_profile": resolved_intent,
+        "requested_profiles": profile_list,
+        "candidates": candidates,
+        "audit_status": "pending",
+    }
+    plan_set["plan_set_path"] = str(plan_set_path)
+    plan_set["plan_set_digest"] = self_digest(plan_set, "plan_set_digest")
+    write_json(plan_set_path, plan_set)
+    return plan_set
 
 
 def canonical_record(record: dict[str, Any]) -> str:
@@ -1249,6 +1372,7 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
     source = validate_session_path(Path(plan["source"]["path"]))
     candidate = Path(plan["candidate_path"]).expanduser().resolve()
     plan_errors: list[str] = []
+    plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
         plan_errors.append("plan digest changed")
     if plan.get("status") == "blocked":
@@ -1283,6 +1407,119 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
     audit["audit_digest"] = self_digest(audit, "audit_digest")
     write_json(Path(plan["audit_path"]), audit)
     return audit
+
+
+def audit_plan_set(plan_set_path: Path) -> dict[str, Any]:
+    plan_set_path = plan_set_path.expanduser().resolve()
+    plan_set = read_json(plan_set_path)
+    errors: list[str] = []
+    if plan_set.get("plan_set_version") != 1:
+        errors.append("unsupported plan-set version; regenerate the plan set")
+    if plan_set.get("plan_set_digest") != self_digest(plan_set, "plan_set_digest"):
+        errors.append("plan-set digest changed")
+    candidates = plan_set.get("candidates")
+    if not isinstance(candidates, list):
+        errors.append("plan-set candidates are missing")
+        candidates = []
+    source = plan_set.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("sha256"), str):
+        errors.append("plan-set source metadata is missing")
+        source = {}
+    requested_profiles = plan_set.get("requested_profiles")
+    if not isinstance(requested_profiles, list) or not requested_profiles:
+        errors.append("plan-set requested profiles are missing")
+        requested_profiles = []
+    requested_profile_set = set(requested_profiles)
+    candidate_audits: list[dict[str, Any]] = []
+    seen_plan_ids: set[str] = set()
+    seen_profiles: set[str] = set()
+    for item in candidates:
+        if not isinstance(item, dict):
+            errors.append("plan-set candidate entry is not an object")
+            continue
+        plan_id = item.get("plan_id")
+        plan_path_value = item.get("plan_path")
+        if not isinstance(plan_id, str) or not isinstance(plan_path_value, str):
+            errors.append("plan-set candidate identity is incomplete")
+            continue
+        if plan_id in seen_plan_ids:
+            errors.append(f"duplicate candidate plan_id: {plan_id}")
+            continue
+        seen_plan_ids.add(plan_id)
+        candidate_plan_path = Path(plan_path_value).expanduser().resolve()
+        try:
+            candidate_plan = read_json(candidate_plan_path)
+            if candidate_plan.get("plan_id") != plan_id:
+                raise ValueError("candidate plan_id does not match plan-set entry")
+            if candidate_plan.get("plan_set_id") != plan_set.get("plan_set_id"):
+                raise ValueError("candidate is bound to a different plan set")
+            if candidate_plan.get("source", {}).get("sha256") != source.get("sha256"):
+                raise ValueError("candidate source hash differs from plan-set source")
+            if item.get("source_sha256") != candidate_plan.get("source", {}).get("sha256"):
+                errors.append(f"candidate {plan_id}: plan-set index source hash does not match candidate")
+            if item.get("audit_path") != candidate_plan.get("audit_path"):
+                errors.append(f"candidate {plan_id}: plan-set index audit path does not match candidate")
+            if item.get("candidate_path") != candidate_plan.get("candidate_path"):
+                errors.append(f"candidate {plan_id}: plan-set index candidate path does not match candidate")
+            if item.get("policy") != candidate_plan.get("policy"):
+                errors.append(f"candidate {plan_id}: plan-set index policy does not match candidate")
+            profile = candidate_plan.get("policy", {}).get("profile")
+            if profile not in requested_profile_set:
+                errors.append(f"candidate {plan_id}: profile is not requested by plan set")
+            elif profile in seen_profiles:
+                errors.append(f"candidate {plan_id}: duplicate profile in plan set")
+            elif isinstance(profile, str):
+                seen_profiles.add(profile)
+            if candidate_plan.get("source", {}).get("path") != source.get("path"):
+                errors.append(f"candidate {plan_id}: candidate source path differs from plan-set source")
+            if candidate_plan.get("intent_profile") != plan_set.get("intent_profile"):
+                errors.append(f"candidate {plan_id}: intent profile differs from plan set")
+            audit = audit_plan(candidate_plan_path)
+        except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            audit = {
+                "plan_id": plan_id,
+                "plan_path": str(candidate_plan_path),
+                "status": "fail",
+                "errors": [str(exc)],
+            }
+        candidate_audits.append(
+            {
+                "plan_id": plan_id,
+                "plan_path": str(candidate_plan_path),
+                "audit_path": item.get("audit_path"),
+                "status": audit.get("status", "fail"),
+                "errors": audit.get("errors", []),
+                "audit_digest": audit.get("audit_digest"),
+            }
+        )
+        if audit.get("status") != "pass":
+            errors.extend(
+                f"candidate {plan_id}: {error}"
+                for error in audit.get("errors", ["candidate audit failed"])
+            )
+
+    status = "pass" if not errors and candidate_audits else "fail"
+    result = {
+        "plan_set_audit_version": 1,
+        "audit_id": uuid.uuid4().hex,
+        "created_at": utc_now(),
+        "plan_set_id": plan_set.get("plan_set_id"),
+        "plan_set_path": str(plan_set_path),
+        "source_sha256": source.get("sha256"),
+        "status": status,
+        "candidate_audits": candidate_audits,
+        "errors": errors,
+    }
+    result["audit_digest"] = self_digest(result, "audit_digest")
+    updated = copy.deepcopy(plan_set)
+    updated["audit_status"] = status
+    updated["candidate_audits"] = candidate_audits
+    updated["audit_id"] = result["audit_id"]
+    updated["audit_digest"] = result["audit_digest"]
+    updated["plan_set_digest"] = self_digest(updated, "plan_set_digest")
+    write_json(plan_set_path, updated)
+    result["plan_set_digest"] = updated["plan_set_digest"]
+    return result
 
 
 def ensure_inside(root: Path, child: Path) -> None:
@@ -1333,6 +1570,16 @@ def validate_session_path(path: Path) -> Path:
 def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = None) -> dict[str, Any]:
     plan_path = plan_path.expanduser().resolve()
     plan = read_json(plan_path)
+    if "plan_set_version" in plan:
+        raise ValueError("apply requires one candidate plan, not a plan set")
+    if plan.get("plan_version") != PLAN_VERSION:
+        raise ValueError("unsupported plan version; regenerate the plan")
+    policy_errors = validate_plan_policy(plan)
+    if policy_errors:
+        raise ValueError("invalid cleanup policy: " + "; ".join(policy_errors))
+    intent_errors = validate_intent_profile(plan.get("intent_profile"))
+    if intent_errors:
+        raise ValueError("invalid intent profile: " + "; ".join(intent_errors))
     if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
         raise ValueError("plan digest changed after audit; regenerate the plan")
     if confirmation != plan.get("plan_id"):
