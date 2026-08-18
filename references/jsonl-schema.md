@@ -263,7 +263,10 @@ again before the final `success` state. A failed operation is retained with
 cannot verify the original, candidate, sidecar, plan identity, or source hash,
 the durable state is `needs_manual_recovery`; automated cleanup and guessing
 are prohibited. The sidecar is provenance only and cannot reconstruct omitted
-source output.
+source output. Backup listing and cleanup also require semantic successful
+batches to retain a hash-valid JSONL `candidate.jsonl` and canonical,
+hash-valid `sidecar.json`; missing or changed staged artifacts make the batch
+invalid and preserve it from automatic deletion.
 
 ## Cleanup Preview: Version 2
 

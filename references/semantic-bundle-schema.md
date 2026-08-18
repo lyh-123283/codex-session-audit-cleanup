@@ -146,7 +146,11 @@ Bundles may carry semantic review metadata such as:
 ```
 
 The planner and critic must be separate review invocations with distinct
-artifacts and input context. Unsupported claims, omitted decisions, unique
+non-empty artifact identities and input context. The executor rejects a bundle
+that reuses the same planner and critic artifact identity. Artifact identities
+are opaque evidence supplied by the review workflow; the executor can bind and
+compare those identities but cannot prove the external invocation history or
+the truth of the review prose. Unsupported claims, omitted decisions, unique
 evidence, uncertain boundaries, or planner/critic disagreement produce
 `review` or `blocked`; they do not authorize an automatic downgrade.
 

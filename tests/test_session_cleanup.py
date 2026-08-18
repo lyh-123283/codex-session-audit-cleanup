@@ -604,6 +604,23 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertEqual(audit["status"], "fail")
             self.assertTrue(any("sidecar" in error for error in audit["errors"]))
 
+    def test_semantic_audit_rejects_reused_planner_and_critic_artifact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root)
+            bundle = copy.deepcopy(fixture["bundle"])
+            bundle["semantic_review"]["critic"]["artifact"] = bundle["semantic_review"]["planner"]["artifact"]
+            bundle_path = root / "same-review-artifact-bundle.json"
+            bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+            plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "reports", bundle_path, 1000, 2
+            )
+
+            audit = session_cleanup.audit_plan(Path(plan["report_path"]))
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("artifacts must be distinct" in error for error in audit["errors"]))
+
     def test_semantic_apply_binds_backup_id_without_changing_reviewed_capsule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = _semantic_plan_fixture(Path(temp_dir))
@@ -676,6 +693,24 @@ class SessionCleanupTests(unittest.TestCase):
             state = session_cleanup.reconcile_apply_batch(batch)
 
             self.assertEqual(state["status"], "needs_manual_recovery")
+
+    def test_semantic_backup_listing_preserves_missing_staged_artifacts(self):
+        for missing_name in ("candidate.jsonl", "sidecar.json"):
+            with self.subTest(missing_name=missing_name), tempfile.TemporaryDirectory() as temp_dir:
+                fixture = _semantic_plan_fixture(Path(temp_dir))
+                self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+                result = session_cleanup.apply_plan(
+                    fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+                )
+                (Path(result["backup_path"]) / missing_name).unlink()
+
+                entries = session_cleanup.list_backups(
+                    fixture["backup_root"], session_id=fixture["plan"]["session_id"]
+                )
+
+                self.assertEqual(entries[0]["status"], "success")
+                self.assertEqual(entries[0]["integrity"], "invalid")
+                self.assertFalse(entries[0]["deletion_eligible"])
 
     def test_profiles_have_expected_thresholds(self):
         self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)

@@ -2077,6 +2077,7 @@ def validate_semantic_review_metadata(
     if not isinstance(review, dict):
         return ["semantic review metadata is missing"]
     errors: list[str] = []
+    artifact_ids: dict[str, str] = {}
     for role in ("planner", "critic"):
         artifact = review.get(role)
         if not isinstance(artifact, dict):
@@ -2085,6 +2086,14 @@ def validate_semantic_review_metadata(
             errors.append(f"semantic {role} review artifact identity is missing")
         elif artifact.get("status") != "pass":
             errors.append(f"semantic {role} review did not pass")
+        else:
+            artifact_ids[role] = artifact["artifact"]
+    if (
+        artifact_ids.get("planner")
+        and artifact_ids.get("critic")
+        and artifact_ids["planner"] == artifact_ids["critic"]
+    ):
+        errors.append("semantic planner and critic artifacts must be distinct")
     if review.get("independent") is not True:
         errors.append("semantic planner and critic are not independent")
     if review.get("disagreements") != []:
@@ -3543,6 +3552,22 @@ def backup_integrity(entry: dict[str, Any], backup_root: Path, session_id: str) 
         records, _, errors = parse_jsonl(original_path)
         if not records or errors:
             return False, "original backup is not valid JSONL"
+        if manifest.get("semantic") is True:
+            candidate_path = checked_backup_file(path, "candidate.jsonl")
+            sidecar_path = checked_backup_file(path, "sidecar.json")
+            candidate_hash = manifest.get("candidate_sha256") or manifest.get("staged_candidate_sha256")
+            sidecar_hash = manifest.get("sidecar_sha256") or manifest.get("staged_sidecar_sha256")
+            if not isinstance(candidate_hash, str) or sha256_file(candidate_path) != candidate_hash:
+                return False, "staged candidate hash mismatch"
+            if not isinstance(sidecar_hash, str) or sha256_file(sidecar_path) != sidecar_hash:
+                return False, "staged sidecar hash mismatch"
+            _, _, candidate_errors = parse_jsonl(candidate_path)
+            if candidate_errors:
+                return False, "staged candidate is not valid JSONL"
+            sidecar_bytes = sidecar_path.read_bytes()
+            sidecar_value = json.loads(sidecar_bytes.decode("utf-8"))
+            if not isinstance(sidecar_value, dict) or canonical_json_bytes(sidecar_value) != sidecar_bytes:
+                return False, "staged sidecar is not canonical JSON"
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return False, str(error)
     return True, "ok"
