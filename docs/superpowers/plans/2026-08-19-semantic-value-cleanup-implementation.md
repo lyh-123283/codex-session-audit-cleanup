@@ -335,7 +335,7 @@ git commit -m "feat: materialize semantic cleanup candidates"
   `candidate_staged`, `source_replaced`, `verified`, `success`, `failed`,
   and `needs_manual_recovery` for semantic apply batches.
 
-- [ ] **Step 1: Write failing audit tests**
+- [x] **Step 1: Write failing audit tests**
 
 Add tests with these names:
 
@@ -374,7 +374,7 @@ def test_semantic_reconciliation_never_guesses_after_replace_crash(self):
     assert state["status"] in {"success", "failed", "needs_manual_recovery"}
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail**
+- [x] **Step 2: Run the focused tests and verify they fail**
 
 ```powershell
 pytest tests/test_session_cleanup.py -k "semantic_audit or semantic_apply or reconciliation" -v
@@ -383,14 +383,14 @@ pytest tests/test_session_cleanup.py -k "semantic_audit or semantic_apply or rec
 Expected: failures because semantic stages and lifecycle validation are not
 implemented.
 
-- [ ] **Step 3: Implement semantic audit stages**
+- [x] **Step 3: Implement semantic audit stages**
 
 Use the bundle's stored hashes as inputs, recompute all source/candidate/
 sidecar identities, validate the reviewed semantic bundle, replay the renderer,
 and compare exact candidate bytes. Reject legacy audit versions for semantic
 plans and reject semantic audit versions for legacy plans.
 
-- [ ] **Step 4: Implement sidecar-aware apply ordering**
+- [x] **Step 4: Implement sidecar-aware apply ordering**
 
 Preserve the existing byte-for-byte backup requirement. For semantic plans,
 verify source and audit first, create the backup and `backup_id`, stage and
@@ -398,7 +398,7 @@ hash the sidecar, stage the candidate, atomically replace the source, verify
 the final hash, then mark the manifest successful. Never regenerate capsule
 text or mutate the reviewed sidecar during apply.
 
-- [ ] **Step 5: Implement idempotent reconciliation and failure reporting**
+- [x] **Step 5: Implement idempotent reconciliation and failure reporting**
 
 On an interrupted batch, compare source, candidate, sidecar, and backup hashes.
 Mark a fully verified replacement successful, restore only from the verified
@@ -406,7 +406,7 @@ original backup when the candidate is not active, and otherwise return
 `needs_manual_recovery` with all paths and hashes. Preserve orphaned and
 failed artifacts.
 
-- [ ] **Step 6: Run audit/apply and full tests**
+- [x] **Step 6: Run audit/apply and full tests**
 
 ```powershell
 pytest tests/test_session_cleanup.py -k "semantic_audit or semantic_apply or reconciliation" -v
@@ -414,7 +414,7 @@ pytest -q
 python -m py_compile scripts/session_cleanup.py tests/test_session_cleanup.py
 ```
 
-- [ ] **Step 7: Commit the audited apply path**
+- [x] **Step 7: Commit the audited apply path**
 
 ```powershell
 git add scripts/session_cleanup.py tests/test_session_cleanup.py

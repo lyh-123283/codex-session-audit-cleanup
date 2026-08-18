@@ -176,6 +176,12 @@ def _semantic_fixture(temp_dir):
         "blocks": [{"block_id": "b-1", "source_lines": [1, 1], "role": "context"}],
         "operations": [operation],
         "sidecar": {"capsule_id": "capsule-1", "rendered_text": rendered_text},
+        "semantic_review": {
+            "planner": {"artifact": "planner-review-1", "status": "pass"},
+            "critic": {"artifact": "critic-review-1", "status": "pass"},
+            "independent": True,
+            "disagreements": [],
+        },
     }
     bundle_path = Path(temp_dir) / "semantic-bundle.json"
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
@@ -186,6 +192,22 @@ def _semantic_fixture(temp_dir):
         "protected_from": 99,
         "bundle": bundle,
         "bundle_path": bundle_path,
+    }
+
+
+def _semantic_plan_fixture(temp_dir):
+    root = Path(temp_dir)
+    fixture = _semantic_fixture(root)
+    plan = session_cleanup.build_semantic_plan(
+        fixture["source"], root / "reports", fixture["bundle_path"], 1000, 2
+    )
+    return {
+        **fixture,
+        "root": root,
+        "plan": plan,
+        "plan_path": Path(plan["report_path"]),
+        "sidecar_path": Path(plan["sidecar"]["path"]),
+        "backup_root": root / "backups",
     }
 
 
@@ -453,6 +475,102 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stderr)
             plan = json.loads(process.stdout)
             self.assertEqual(plan["candidate_kind"], "semantic_cleanup")
+
+    def test_semantic_audit_requires_ordered_v3_stages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+
+            audit = session_cleanup.audit_plan(fixture["plan_path"])
+
+            self.assertEqual(audit["status"], "pass")
+            self.assertEqual(audit["audit_version"], 3)
+            self.assertEqual(
+                [stage["name"] for stage in audit["stages"]],
+                ["schema", "semantic_review", "policy", "deterministic_transform", "integrity"],
+            )
+
+    def test_semantic_audit_rejects_changed_sidecar_or_rendered_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            fixture["sidecar_path"].write_bytes(fixture["sidecar_path"].read_bytes() + b"x")
+
+            audit = session_cleanup.audit_plan(fixture["plan_path"])
+
+            self.assertEqual(audit["status"], "fail")
+            self.assertTrue(any("sidecar" in error for error in audit["errors"]))
+
+    def test_semantic_apply_binds_backup_id_without_changing_reviewed_capsule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            audit = session_cleanup.audit_plan(fixture["plan_path"])
+            self.assertEqual(audit["status"], "pass")
+            sidecar_before = fixture["sidecar_path"].read_bytes()
+            candidate_sha256 = fixture["plan"]["candidate"]["sha256"]
+
+            result = session_cleanup.apply_plan(
+                fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+            )
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(fixture["sidecar_path"].read_bytes(), sidecar_before)
+            self.assertEqual(session_cleanup.sha256_file(fixture["source"]), candidate_sha256)
+            manifest = json.loads(
+                (Path(result["backup_path"]) / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "success")
+            self.assertEqual(manifest["backup_id"], result["backup_id"])
+            self.assertEqual(manifest["sidecar_sha256"], fixture["plan"]["sidecar"]["sha256"])
+
+    def test_semantic_apply_rejects_stale_source_or_missing_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+            fixture["source"].write_bytes(fixture["source"].read_bytes() + b"\n")
+
+            with self.assertRaises(ValueError):
+                session_cleanup.apply_plan(
+                    fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+            fixture["sidecar_path"].unlink()
+
+            with self.assertRaises(ValueError):
+                session_cleanup.apply_plan(
+                    fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+                )
+
+    def test_semantic_reconciliation_reports_verified_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+            result = session_cleanup.apply_plan(
+                fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+            )
+
+            state = session_cleanup.reconcile_apply_batch(Path(result["backup_path"]))
+
+            self.assertEqual(state["status"], "success")
+
+    def test_semantic_reconciliation_rejects_tampered_batch_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_plan_fixture(Path(temp_dir))
+            self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+            result = session_cleanup.apply_plan(
+                fixture["plan_path"], fixture["plan"]["plan_id"], fixture["backup_root"]
+            )
+            batch = Path(result["backup_path"])
+            manifest_path = batch / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["backup_version"] = 99
+            manifest["session_id"] = "different-session"
+            write_manifest(manifest_path, manifest)
+
+            state = session_cleanup.reconcile_apply_batch(batch)
+
+            self.assertEqual(state["status"], "needs_manual_recovery")
 
     def test_profiles_have_expected_thresholds(self):
         self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)

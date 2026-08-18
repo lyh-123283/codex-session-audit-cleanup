@@ -53,6 +53,13 @@ PROFILE_POLICIES = {
     },
 }
 AUDIT_STAGE_NAMES = ("schema", "policy", "deterministic_transform", "integrity")
+SEMANTIC_AUDIT_STAGE_NAMES = (
+    "schema",
+    "semantic_review",
+    "policy",
+    "deterministic_transform",
+    "integrity",
+)
 BACKUP_INTERNAL_DIRS = {".prune-previews", ".prune-quarantine"}
 RESERVED_NAMES = {
     "session_index.jsonl",
@@ -1956,6 +1963,385 @@ def audit_snapshot_input(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def semantic_boundary_metadata(
+    records: list[dict[str, Any]], plan: dict[str, Any]
+) -> tuple[int, list[str], dict[str, Any]]:
+    region = plan.get("protected_region")
+    if not isinstance(region, dict):
+        return 1, ["protected region metadata is missing"], {}
+    errors: list[str] = []
+    try:
+        recent_records = region["fallback_recent_records"]
+        recent_compactions = region["requested_logical_compactions"]
+        if not _is_int(recent_records) or not _is_int(recent_compactions):
+            raise ValueError("semantic protected boundary values must be integers")
+        expected = boundary_metadata(records, recent_records, recent_compactions)
+    except (KeyError, TypeError, ValueError) as exc:
+        return 1, [f"invalid semantic protected region metadata: {exc}"], {}
+    for field in (
+        "from_line",
+        "reason",
+        "includes_from_line",
+        "logical_compactions",
+        "requested_logical_compactions",
+        "available_logical_compactions",
+        "selected_boundary_lines",
+        "fallback_recent_records",
+    ):
+        if region.get(field) != expected[field]:
+            errors.append(f"semantic protected boundary metadata mismatch: {field}")
+    return expected["from_line"], errors, expected
+
+
+def _semantic_map_value(bundle: dict[str, Any]) -> dict[str, Any]:
+    semantic_map = copy.deepcopy(bundle.get("semantic_map"))
+    if isinstance(semantic_map, dict):
+        return semantic_map
+    return {
+        "semantic_map_version": bundle.get("semantic_map_version"),
+        "source_sha256": bundle.get("source", {}).get("sha256")
+        if isinstance(bundle.get("source"), dict)
+        else None,
+        "blocks": copy.deepcopy(bundle.get("blocks", [])),
+    }
+
+
+def load_semantic_bundle_artifacts(
+    plan: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Read and verify the canonical sidecar and its original bundle input."""
+    errors: list[str] = []
+    sidecar = plan.get("sidecar")
+    if not isinstance(sidecar, dict) or not isinstance(sidecar.get("path"), str):
+        return None, ["semantic sidecar metadata is missing"]
+    sidecar_path = Path(sidecar["path"]).expanduser().resolve()
+    if sidecar_path.is_symlink() or not sidecar_path.is_file():
+        errors.append("semantic sidecar file is missing or not a regular file")
+        return None, errors
+    actual_sidecar = fingerprint(sidecar_path)
+    if actual_sidecar["path"] != sidecar.get("path"):
+        errors.append("semantic sidecar path changed")
+    if actual_sidecar["size"] != sidecar.get("size"):
+        errors.append("semantic sidecar size changed")
+    if actual_sidecar["sha256"] != sidecar.get("sha256"):
+        errors.append("semantic sidecar hash changed")
+    if sidecar.get("canonical_json") is not True:
+        errors.append("semantic sidecar canonical marker is missing")
+
+    bundle: dict[str, Any] | None = None
+    try:
+        raw_sidecar = sidecar_path.read_bytes()
+        decoded = json.loads(raw_sidecar.decode("utf-8"))
+        if not isinstance(decoded, dict):
+            raise ValueError("sidecar must contain a JSON object")
+        if canonical_json_bytes(decoded) != raw_sidecar:
+            errors.append("semantic sidecar is not canonical JSON")
+        bundle = decoded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"semantic sidecar is unreadable: {exc}")
+
+    bundle_metadata = plan.get("bundle")
+    if not isinstance(bundle_metadata, dict) or not isinstance(bundle_metadata.get("path"), str):
+        errors.append("semantic bundle input metadata is missing")
+    else:
+        bundle_path = Path(bundle_metadata["path"]).expanduser().resolve()
+        expected_bundle = bundle_metadata.get("fingerprint")
+        if bundle_path.is_symlink() or not bundle_path.is_file():
+            errors.append("semantic bundle input is missing or not a regular file")
+        elif not isinstance(expected_bundle, dict):
+            errors.append("semantic bundle input fingerprint is missing")
+        else:
+            actual_bundle = fingerprint(bundle_path)
+            if actual_bundle["sha256"] != expected_bundle.get("sha256"):
+                errors.append("semantic bundle input hash changed")
+            if actual_bundle["size"] != expected_bundle.get("size"):
+                errors.append("semantic bundle input size changed")
+    if bundle is not None:
+        if bundle.get("operations") != plan.get("operations"):
+            errors.append("semantic operations changed after planning")
+        if bundle.get("blocks") != plan.get("blocks"):
+            errors.append("semantic blocks changed after planning")
+        if bundle.get("semantic_review", {}) != plan.get("semantic_review", {}):
+            errors.append("semantic review metadata changed after planning")
+        if plan.get("semantic_map_digest") != sha256_bytes(
+            canonical_json_bytes(_semantic_map_value(bundle))
+        ):
+            errors.append("semantic map digest changed after planning")
+    return bundle, list(dict.fromkeys(errors))
+
+
+def validate_semantic_review_metadata(
+    bundle: dict[str, Any], plan: dict[str, Any]
+) -> list[str]:
+    review = bundle.get("semantic_review")
+    if not isinstance(review, dict):
+        return ["semantic review metadata is missing"]
+    errors: list[str] = []
+    for role in ("planner", "critic"):
+        artifact = review.get(role)
+        if not isinstance(artifact, dict):
+            errors.append(f"semantic {role} review artifact is missing")
+        elif not isinstance(artifact.get("artifact"), str) or not artifact["artifact"]:
+            errors.append(f"semantic {role} review artifact identity is missing")
+        elif artifact.get("status") != "pass":
+            errors.append(f"semantic {role} review did not pass")
+    if review.get("independent") is not True:
+        errors.append("semantic planner and critic are not independent")
+    if review.get("disagreements") != []:
+        errors.append("semantic review contains unresolved disagreements")
+    if review != plan.get("semantic_review", {}):
+        errors.append("semantic review metadata is not bound to the plan")
+    return errors
+
+
+def validate_semantic_plan_metadata(plan: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if plan.get("plan_version") != SEMANTIC_PLAN_VERSION:
+        errors.append("unsupported semantic plan version; regenerate the plan")
+    if plan.get("audit_version") != SEMANTIC_AUDIT_VERSION:
+        errors.append("unsupported semantic audit version; regenerate the plan")
+    if plan.get("candidate_kind") != "semantic_cleanup":
+        errors.append("semantic candidate kind is missing")
+    if plan.get("status") != "ready_for_review":
+        errors.append("semantic plan is not ready for review")
+    if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
+        errors.append("semantic plan digest changed")
+    if not isinstance(plan.get("operations"), list):
+        errors.append("semantic plan operations are missing")
+    if not isinstance(plan.get("blocks"), list):
+        errors.append("semantic plan blocks are missing")
+    protected_region = plan.get("protected_region")
+    if not isinstance(protected_region, dict):
+        errors.append("semantic protected region is missing")
+    else:
+        expected_risk = build_semantic_residual_risk(
+            str(plan.get("status")),
+            plan.get("operations") if isinstance(plan.get("operations"), list) else [],
+            protected_region,
+        )
+        if plan.get("residual_risk") != expected_risk:
+            errors.append("semantic residual risk metadata changed")
+    if not isinstance(plan.get("sidecar"), dict):
+        errors.append("semantic sidecar metadata is missing")
+    if not isinstance(plan.get("bundle"), dict):
+        errors.append("semantic bundle metadata is missing")
+    return errors
+
+
+def audit_semantic_review_stage(
+    source: Path, candidate: Path, plan: dict[str, Any]
+) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    errors: list[str] = []
+    bundle, artifact_errors = load_semantic_bundle_artifacts(plan)
+    errors.extend(artifact_errors)
+    source_records = source_snapshot["records"]
+    source_lines = source_snapshot["lines"]
+    protected_from, boundary_errors, expected_boundary = semantic_boundary_metadata(source_records, plan)
+    errors.extend(boundary_errors)
+    if source_snapshot["errors"]:
+        errors.extend(f"source line {item['line']}: {item['error']}" for item in source_snapshot["errors"])
+    if bundle is not None and not source_snapshot["errors"]:
+        errors.extend(validate_semantic_bundle(bundle, source_records, source_lines, protected_from))
+        errors.extend(validate_semantic_review_metadata(bundle, plan))
+    return make_audit_stage(
+        "semantic_review",
+        "pass" if not errors else "fail",
+        [
+            "canonical sidecar and original bundle are unchanged",
+            "planner and independent critic review artifacts are bound",
+            "semantic operations remain source-linked and outside the protected region",
+        ],
+        list(dict.fromkeys(errors)),
+        {
+            "source": audit_snapshot_input(source_snapshot),
+            "candidate": audit_snapshot_input(candidate_snapshot),
+            "sidecar": plan.get("sidecar"),
+            "semantic_map_digest": plan.get("semantic_map_digest"),
+            "protected_from": protected_from,
+            "boundary": expected_boundary,
+        },
+        {"operations": len(plan.get("operations", []))},
+    )
+
+
+def audit_semantic_policy_stage(
+    source: Path, candidate: Path, plan: dict[str, Any]
+) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    errors: list[str] = []
+    bundle, artifact_errors = load_semantic_bundle_artifacts(plan)
+    errors.extend(artifact_errors)
+    source_records = source_snapshot["records"]
+    candidate_records = candidate_snapshot["records"]
+    source_lines = source_snapshot["lines"]
+    candidate_lines = candidate_snapshot["lines"]
+    protected_from, boundary_errors, expected_boundary = semantic_boundary_metadata(source_records, plan)
+    errors.extend(boundary_errors)
+    if len(source_records) != len(candidate_records) or len(source_lines) != len(candidate_lines):
+        errors.append("semantic candidate record or line count changed")
+    operations = plan.get("operations") if isinstance(plan.get("operations"), list) else []
+    declared_lines = {
+        operation.get("line")
+        for operation in operations
+        if isinstance(operation, dict) and _is_int(operation.get("line"))
+    }
+    actual_changed_lines: set[int] = set()
+    for line_number, (source_line, candidate_line, source_record) in enumerate(
+        zip(source_lines, candidate_lines, source_records), start=1
+    ):
+        if source_line != candidate_line:
+            actual_changed_lines.add(line_number)
+            if line_number not in declared_lines:
+                errors.append(f"unexpected semantic byte change at line {line_number}")
+            if line_number >= protected_from:
+                errors.append(f"semantic protected record changed at line {line_number}")
+            if is_visible_message(source_record):
+                errors.append(f"semantic visible message changed at line {line_number}")
+            if payload_type(source_record) not in TOOL_OUTPUT_TYPES:
+                errors.append(f"semantic non-tool-output record changed at line {line_number}")
+    if actual_changed_lines != declared_lines:
+        errors.append("semantic changed line set does not match declared operations")
+    errors.extend(compare_sequences(source_records, candidate_records))
+    if bundle is not None and not source_snapshot["errors"]:
+        errors.extend(validate_semantic_bundle(bundle, source_records, source_lines, protected_from))
+    return make_audit_stage(
+        "policy",
+        "pass" if not errors else "fail",
+        [
+            "only declared semantic output nodes changed",
+            "protected records and visible messages are byte-for-byte unchanged",
+            "tool call and output ID sequences remain stable",
+        ],
+        list(dict.fromkeys(errors)),
+        {
+            "source": audit_snapshot_input(source_snapshot),
+            "candidate": audit_snapshot_input(candidate_snapshot),
+            "declared_lines": sorted(declared_lines),
+            "actual_changed_lines": sorted(actual_changed_lines),
+            "protected_from": protected_from,
+            "boundary": expected_boundary,
+        },
+        {"changed_lines": sorted(actual_changed_lines)},
+    )
+
+
+def audit_semantic_transform_stage(
+    source: Path, candidate: Path, plan: dict[str, Any]
+) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    errors: list[str] = []
+    bundle, artifact_errors = load_semantic_bundle_artifacts(plan)
+    errors.extend(artifact_errors)
+    source_records = source_snapshot["records"]
+    source_lines = source_snapshot["lines"]
+    protected_from, boundary_errors, expected_boundary = semantic_boundary_metadata(source_records, plan)
+    errors.extend(boundary_errors)
+    if source_snapshot["sha256"] != plan.get("source", {}).get("sha256"):
+        errors.append("source SHA-256 changed since semantic plan generation")
+    if candidate_snapshot["sha256"] != plan.get("candidate", {}).get("sha256"):
+        errors.append("candidate SHA-256 changed since semantic plan generation")
+    replay_result: dict[str, Any] | None = None
+    if bundle is not None and not source_snapshot["errors"]:
+        try:
+            with tempfile.TemporaryDirectory(prefix="semantic-replay-") as temp_dir:
+                replay_path = Path(temp_dir) / "candidate.jsonl"
+                replay_result = materialize_semantic_candidate(
+                    source,
+                    replay_path,
+                    bundle,
+                    source_records,
+                    source_lines,
+                    protected_from,
+                )
+                if replay_path.read_bytes() != candidate.read_bytes():
+                    errors.append("semantic candidate does not match deterministic renderer")
+        except (OSError, ValueError) as exc:
+            errors.append(f"semantic deterministic replay failed: {exc}")
+    expected_changed_lines = plan.get("transformation", {}).get("changed_lines")
+    if replay_result is not None and replay_result.get("changed_lines") != expected_changed_lines:
+        errors.append("semantic transformation metadata does not match deterministic renderer")
+    return make_audit_stage(
+        "deterministic_transform",
+        "pass" if not errors else "fail",
+        [
+            "candidate bytes are reproduced from source, sidecar, and reviewed operations",
+            "capsule text is never regenerated during audit",
+        ],
+        list(dict.fromkeys(errors)),
+        {
+            "source": audit_snapshot_input(source_snapshot),
+            "candidate": audit_snapshot_input(candidate_snapshot),
+            "protected_from": protected_from,
+            "boundary": expected_boundary,
+            "sidecar": plan.get("sidecar"),
+            "transformation": plan.get("transformation"),
+        },
+        {"candidate_lines": len(candidate_snapshot["lines"])},
+    )
+
+
+def audit_semantic_integrity_stage(
+    source: Path, candidate: Path, plan: dict[str, Any]
+) -> dict[str, Any]:
+    source_snapshot = audit_file_snapshot(source)
+    candidate_snapshot = audit_file_snapshot(candidate)
+    errors: list[str] = []
+    _, artifact_errors = load_semantic_bundle_artifacts(plan)
+    errors.extend(artifact_errors)
+    source_records = source_snapshot["records"]
+    candidate_records = candidate_snapshot["records"]
+    if source_snapshot["sha256"] != plan.get("source", {}).get("sha256"):
+        errors.append("source SHA-256 changed since semantic plan generation")
+    if candidate_snapshot["sha256"] != plan.get("candidate", {}).get("sha256"):
+        errors.append("candidate SHA-256 changed since semantic plan generation")
+    if source_snapshot["errors"] or candidate_snapshot["errors"]:
+        errors.extend(f"source line {item['line']}: {item['error']}" for item in source_snapshot["errors"])
+        errors.extend(f"candidate line {item['line']}: {item['error']}" for item in candidate_snapshot["errors"])
+    if len(source_records) != len(candidate_records):
+        errors.append("semantic record count changed")
+    errors.extend(compare_sequences(source_records, candidate_records))
+    source_stats = collect_stats(source, source_records, source_snapshot["errors"])
+    candidate_stats = collect_stats(candidate, candidate_records, candidate_snapshot["errors"])
+    if source_stats["session_id"] != candidate_stats["session_id"]:
+        errors.append("semantic session ID changed")
+    if source_stats["visible_message_lines"] != candidate_stats["visible_message_lines"]:
+        errors.append("semantic visible message line sequence changed")
+    if source_stats["logical_compaction_lines"] != candidate_stats["logical_compaction_lines"]:
+        errors.append("semantic compaction boundary sequence changed")
+    protected_from, boundary_errors, expected_boundary = semantic_boundary_metadata(source_records, plan)
+    errors.extend(boundary_errors)
+    source_lines = source_snapshot["lines"]
+    candidate_lines = candidate_snapshot["lines"]
+    for line_number in range(protected_from, min(len(source_lines), len(candidate_lines)) + 1):
+        if source_lines[line_number - 1] != candidate_lines[line_number - 1]:
+            errors.append(f"semantic protected line changed at line {line_number}")
+    return make_audit_stage(
+        "integrity",
+        "pass" if not errors else "fail",
+        [
+            "source and candidate hashes match the reviewed plan",
+            "record order, session identity, compaction boundaries, and tool IDs remain stable",
+            "protected content remains byte-for-byte unchanged",
+        ],
+        list(dict.fromkeys(errors)),
+        {
+            "source": audit_snapshot_input(source_snapshot),
+            "candidate": audit_snapshot_input(candidate_snapshot),
+            "protected_from": protected_from,
+            "boundary": expected_boundary,
+            "sidecar": plan.get("sidecar"),
+        },
+        {
+            "source_records": len(source_records),
+            "candidate_records": len(candidate_records),
+        },
+    )
+
+
 def make_audit_stage(
     name: str,
     status: str,
@@ -1982,7 +2368,12 @@ def validate_audit_stages(audit: dict[str, Any]) -> list[str]:
     if not isinstance(stages, list):
         return ["audit stages are missing"]
     names = [stage.get("name") if isinstance(stage, dict) else None for stage in stages]
-    if names != list(AUDIT_STAGE_NAMES):
+    expected_names = (
+        SEMANTIC_AUDIT_STAGE_NAMES
+        if audit.get("audit_version") == SEMANTIC_AUDIT_VERSION
+        else AUDIT_STAGE_NAMES
+    )
+    if names != list(expected_names):
         return ["audit stages are missing, duplicated, or out of order"]
     errors: list[str] = []
     for stage in stages:
@@ -2256,6 +2647,14 @@ def audit_integrity_stage(source: Path, candidate: Path, plan: dict[str, Any]) -
 
 
 def build_audit_stages(source: Path, candidate: Path, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    if plan.get("candidate_kind") == "semantic_cleanup" or plan.get("plan_version") == SEMANTIC_PLAN_VERSION:
+        return [
+            audit_schema_stage(source, candidate, plan),
+            audit_semantic_review_stage(source, candidate, plan),
+            audit_semantic_policy_stage(source, candidate, plan),
+            audit_semantic_transform_stage(source, candidate, plan),
+            audit_semantic_integrity_stage(source, candidate, plan),
+        ]
     return [
         audit_schema_stage(source, candidate, plan),
         audit_policy_stage(source, candidate, plan),
@@ -2269,14 +2668,19 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
     plan = read_json(plan_path)
     source = validate_session_path(Path(plan["source"]["path"]))
     candidate = Path(plan["candidate_path"]).expanduser().resolve()
+    semantic = plan.get("candidate_kind") == "semantic_cleanup" or plan.get("plan_version") == SEMANTIC_PLAN_VERSION
     plan_errors: list[str] = []
-    plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
-    plan_errors.extend(validate_plan_semantics(plan))
-    plan_errors.extend(validate_residual_risk(plan))
-    if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
-        plan_errors.append("plan digest changed")
-    if plan.get("status") != "ready_for_review":
-        plan_errors.append("plan is not ready for review")
+    if semantic:
+        plan_errors.extend(validate_semantic_plan_metadata(plan))
+        plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
+    else:
+        plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
+        plan_errors.extend(validate_plan_semantics(plan))
+        plan_errors.extend(validate_residual_risk(plan))
+        if plan.get("plan_digest") != self_digest(plan, "plan_digest"):
+            plan_errors.append("plan digest changed")
+        if plan.get("status") != "ready_for_review":
+            plan_errors.append("plan is not ready for review")
     stage_results = build_audit_stages(source, candidate, plan)
     errors: list[str] = []
     for error in [*plan_errors, *(error for stage in stage_results for error in stage["errors"])]:
@@ -2284,7 +2688,7 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
             errors.append(error)
     status = "pass" if not errors and all(stage["status"] == "pass" for stage in stage_results) else "fail"
     audit = {
-        "audit_version": 2,
+        "audit_version": SEMANTIC_AUDIT_VERSION if semantic else 2,
         "audit_id": uuid.uuid4().hex,
         "created_at": utc_now(),
         "plan_id": plan["plan_id"],
@@ -2304,6 +2708,8 @@ def audit_plan(plan_path: Path) -> dict[str, Any]:
         },
         "errors": errors,
     }
+    if semantic:
+        audit["sidecar_sha256"] = plan.get("sidecar", {}).get("sha256")
     audit["audit_digest"] = self_digest(audit, "audit_digest")
     write_json(Path(plan["audit_path"]), audit)
     return audit
@@ -2463,6 +2869,312 @@ def validate_preview_id(preview_id: str) -> str:
     return preview_id
 
 
+def apply_semantic_plan_document(
+    plan_path: Path,
+    confirmation: str,
+    backup_root: Path | None,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    plan_errors = validate_semantic_plan_metadata(plan)
+    plan_errors.extend(validate_intent_profile(plan.get("intent_profile")))
+    if plan_errors:
+        raise ValueError("invalid semantic cleanup plan: " + "; ".join(dict.fromkeys(plan_errors)))
+    if confirmation != plan.get("plan_id"):
+        raise ValueError("confirmation must exactly equal plan_id")
+
+    audit_path = Path(plan["audit_path"]).expanduser().resolve()
+    if not audit_path.is_file():
+        raise ValueError("independent semantic audit is required before apply")
+    audit = read_json(audit_path)
+    if audit.get("audit_digest") != self_digest(audit, "audit_digest"):
+        raise ValueError("semantic audit digest changed after review")
+    stage_errors = validate_audit_stages(audit)
+    fresh_audit_errors = audit_matches_current_files(plan, audit)
+    if audit.get("audit_version") != SEMANTIC_AUDIT_VERSION or audit.get("status") != "pass":
+        raise ValueError("independent semantic audit did not pass for this plan")
+    if stage_errors:
+        raise ValueError("semantic audit stage validation failed: " + "; ".join(stage_errors))
+    if fresh_audit_errors:
+        raise ValueError("semantic audit no longer matches current files: " + "; ".join(fresh_audit_errors))
+    if audit.get("plan_id") != plan.get("plan_id") or audit.get("plan_digest") != plan.get("plan_digest"):
+        raise ValueError("semantic audit is not bound to the current plan")
+    if audit.get("plan_path") != str(plan_path):
+        raise ValueError("semantic audit is bound to a different plan path")
+    if audit.get("source_sha256") != plan.get("source", {}).get("sha256"):
+        raise ValueError("semantic audit source hash does not match the current plan")
+    if audit.get("candidate_sha256") != plan.get("candidate", {}).get("sha256"):
+        raise ValueError("semantic audit candidate hash does not match the current plan")
+    if audit.get("sidecar_sha256") != plan.get("sidecar", {}).get("sha256"):
+        raise ValueError("semantic audit sidecar hash does not match the current plan")
+
+    bundle, artifact_errors = load_semantic_bundle_artifacts(plan)
+    if artifact_errors or bundle is None:
+        raise ValueError("semantic sidecar verification failed: " + "; ".join(artifact_errors))
+    source = validate_session_path(Path(plan["source"]["path"]))
+    candidate = Path(plan["candidate_path"]).expanduser().resolve()
+    sidecar = Path(plan["sidecar"]["path"]).expanduser().resolve()
+    if fingerprint(source)["sha256"] != plan["source"]["sha256"]:
+        raise ValueError("source changed after semantic review; regenerate the plan")
+    if fingerprint(candidate)["sha256"] != plan["candidate"]["sha256"]:
+        raise ValueError("candidate changed after semantic review; regenerate the plan")
+    if fingerprint(sidecar)["sha256"] != plan["sidecar"]["sha256"]:
+        raise ValueError("sidecar changed after semantic review; regenerate the plan")
+    locks = find_locks(source)
+    if locks:
+        raise ValueError("writer lock detected: " + ", ".join(locks))
+
+    backup_root = (backup_root or default_backup_root()).expanduser().resolve()
+    session_id = plan.get("session_id") or source.stem
+    validate_backup_session_id(str(session_id))
+    backup_id = f"{utc_now().replace(':', '').replace('-', '')}-{uuid.uuid4().hex[:8]}"
+    backup_dir = backup_root / str(session_id) / backup_id
+    ensure_inside(backup_root, backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    original_backup = backup_dir / "original.jsonl"
+    staged_sidecar = backup_dir / "sidecar.json"
+    staged_candidate = backup_dir / "candidate.jsonl"
+    manifest_path = backup_dir / "manifest.json"
+    manifest: dict[str, Any] = {
+        "backup_version": BACKUP_VERSION,
+        "backup_id": backup_id,
+        "session_id": session_id,
+        "semantic": True,
+        "status": "new",
+        "created_at": utc_now(),
+        "source_path": str(source),
+        "plan_id": plan["plan_id"],
+        "plan_path": str(plan_path),
+        "audit_path": str(audit_path),
+        "candidate_path": str(candidate),
+        "candidate_sha256": plan["candidate"]["sha256"],
+        "sidecar_source_path": str(sidecar),
+        "sidecar_sha256": plan["sidecar"]["sha256"],
+    }
+    source_mode = source.stat().st_mode
+    temp_path: Path | None = None
+    replaced = False
+
+    def checkpoint(status: str, **fields: Any) -> None:
+        manifest.update(fields)
+        manifest["status"] = status
+        write_manifest(manifest_path, manifest)
+
+    try:
+        write_manifest(manifest_path, manifest)
+        if sha256_file(source) != plan["source"]["sha256"]:
+            raise ValueError("source changed before backup creation")
+        copy_file_fsync(source, original_backup)
+        original_hash = sha256_file(original_backup)
+        if original_hash != plan["source"]["sha256"]:
+            raise ValueError("verified original backup hash does not match source")
+        checkpoint(
+            "backup_verified",
+            original_sha256=original_hash,
+            original_bytes=original_backup.stat().st_size,
+        )
+
+        copy_file_fsync(sidecar, staged_sidecar)
+        if sha256_file(staged_sidecar) != plan["sidecar"]["sha256"]:
+            raise ValueError("staged sidecar hash does not match reviewed sidecar")
+        checkpoint(
+            "sidecar_staged",
+            staged_sidecar_path=str(staged_sidecar),
+            staged_sidecar_sha256=sha256_file(staged_sidecar),
+            staged_sidecar_bytes=staged_sidecar.stat().st_size,
+        )
+
+        copy_file_fsync(candidate, staged_candidate)
+        if sha256_file(staged_candidate) != plan["candidate"]["sha256"]:
+            raise ValueError("staged candidate hash does not match reviewed candidate")
+        checkpoint(
+            "candidate_staged",
+            staged_candidate_path=str(staged_candidate),
+            staged_candidate_sha256=sha256_file(staged_candidate),
+            staged_candidate_bytes=staged_candidate.stat().st_size,
+        )
+
+        if sha256_file(source) != plan["source"]["sha256"]:
+            raise ValueError("source changed during semantic staging")
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=source.parent, prefix=f".{source.name}.semantic-cleanup-", suffix=".tmp", delete=False
+        ) as handle:
+            temp_path = Path(handle.name)
+            with staged_candidate.open("rb") as candidate_handle:
+                shutil.copyfileobj(candidate_handle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, source_mode)
+        os.replace(temp_path, source)
+        temp_path = None
+        replaced = True
+        checkpoint("source_replaced", final_sha256=sha256_file(source))
+        if sha256_file(source) != plan["candidate"]["sha256"]:
+            raise ValueError("post-write source hash does not match semantic candidate")
+        if sha256_file(original_backup) != plan["source"]["sha256"]:
+            raise ValueError("original backup hash changed after replacement")
+        if sha256_file(staged_sidecar) != plan["sidecar"]["sha256"]:
+            raise ValueError("staged sidecar hash changed after replacement")
+        checkpoint("verified", final_sha256=sha256_file(source))
+        checkpoint("success", final_sha256=sha256_file(source))
+    except Exception as error:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+        rollback_error: Exception | None = None
+        if replaced and original_backup.is_file() and manifest.get("original_sha256"):
+            try:
+                if sha256_file(original_backup) != manifest["original_sha256"]:
+                    raise ValueError("original backup is not verified for rollback")
+                copy_file_fsync(original_backup, source)
+                os.chmod(source, source_mode)
+                if sha256_file(source) != manifest["original_sha256"]:
+                    raise ValueError("semantic rollback hash does not match original")
+            except Exception as rollback_exception:  # pragma: no cover - disk/permission dependent
+                rollback_error = rollback_exception
+        manifest["status"] = "needs_manual_recovery" if rollback_error else "failed"
+        manifest["error"] = str(error)
+        if rollback_error:
+            manifest["rollback_error"] = str(rollback_error)
+        try:
+            write_manifest(manifest_path, manifest)
+        except OSError:
+            pass
+        if rollback_error:
+            raise RuntimeError(
+                f"semantic apply failed and rollback requires manual recovery: {error}; {rollback_error}"
+            ) from error
+        raise
+    return {
+        "status": "success",
+        "backup_id": backup_id,
+        "backup_path": str(backup_dir),
+        "source_path": str(source),
+        "source_sha256": sha256_file(source),
+        "candidate_sha256": plan["candidate"]["sha256"],
+        "sidecar_sha256": plan["sidecar"]["sha256"],
+    }
+
+
+def reconcile_apply_batch(batch_dir: Path, backup_root: Path | None = None) -> dict[str, Any]:
+    """Reconcile a semantic apply batch without guessing after interruption."""
+    batch_dir = batch_dir.expanduser().resolve()
+    if batch_dir.is_symlink() or not batch_dir.is_dir():
+        raise ValueError("apply batch is not a regular managed directory")
+    manifest_path = batch_dir / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("apply batch manifest is missing")
+    manifest = read_json(manifest_path)
+    base = {"batch_path": str(batch_dir), "backup_id": manifest.get("backup_id")}
+    if manifest.get("semantic") is not True:
+        return {**base, "status": "needs_manual_recovery", "reason": "batch is not semantic"}
+    if manifest.get("manifest_digest") != self_digest(manifest, "manifest_digest"):
+        return {**base, "status": "needs_manual_recovery", "reason": "manifest digest mismatch"}
+    if manifest.get("backup_version") != BACKUP_VERSION:
+        return {**base, "status": "needs_manual_recovery", "reason": "unsupported backup version"}
+    backup_id = manifest.get("backup_id")
+    session_id = manifest.get("session_id")
+    if (
+        not isinstance(backup_id, str)
+        or not backup_id
+        or any(separator in backup_id for separator in ("/", "\\", ":"))
+        or batch_dir.name != backup_id
+        or not isinstance(session_id, str)
+        or batch_dir.parent.name != session_id
+    ):
+        return {**base, "status": "needs_manual_recovery", "reason": "backup batch identity does not match its path"}
+    try:
+        validate_backup_session_id(session_id)
+    except ValueError as exc:
+        return {**base, "status": "needs_manual_recovery", "reason": str(exc)}
+    if backup_root is not None:
+        try:
+            managed_root = backup_root.expanduser().resolve()
+            ensure_inside(managed_root, batch_dir)
+            if batch_dir.parent.parent != managed_root:
+                raise ValueError("backup batch is not directly under the managed root")
+        except ValueError as exc:
+            return {**base, "status": "needs_manual_recovery", "reason": str(exc)}
+    original = batch_dir / "original.jsonl"
+    staged_candidate = batch_dir / "candidate.jsonl"
+    staged_sidecar = batch_dir / "sidecar.json"
+    try:
+        source = validate_session_path(Path(str(manifest.get("source_path", ""))))
+    except ValueError as exc:
+        return {**base, "status": "needs_manual_recovery", "reason": f"invalid source path: {exc}"}
+    expected_original = manifest.get("original_sha256")
+    expected_candidate = manifest.get("candidate_sha256") or manifest.get("staged_candidate_sha256")
+    expected_sidecar = manifest.get("sidecar_sha256") or manifest.get("staged_sidecar_sha256")
+    reasons: list[str] = []
+    if not original.is_file() or not expected_original or sha256_file(original) != expected_original:
+        reasons.append("verified original backup is unavailable")
+    if not staged_candidate.is_file() or not expected_candidate or sha256_file(staged_candidate) != expected_candidate:
+        reasons.append("staged candidate is unavailable or changed")
+    if not staged_sidecar.is_file() or not expected_sidecar or sha256_file(staged_sidecar) != expected_sidecar:
+        reasons.append("staged sidecar is unavailable or changed")
+    for path in (original, staged_candidate, staged_sidecar):
+        if path.is_symlink():
+            reasons.append(f"staged recovery artifact is symlinked: {path.name}")
+    if staged_candidate.is_file() and not staged_candidate.is_symlink():
+        _, _, candidate_errors = parse_jsonl(staged_candidate)
+        if candidate_errors:
+            reasons.append("staged candidate is not valid JSONL")
+    if staged_sidecar.is_file() and not staged_sidecar.is_symlink():
+        try:
+            sidecar_bytes = staged_sidecar.read_bytes()
+            sidecar_value = json.loads(sidecar_bytes.decode("utf-8"))
+            if not isinstance(sidecar_value, dict) or canonical_json_bytes(sidecar_value) != sidecar_bytes:
+                reasons.append("staged sidecar is not canonical JSON")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            reasons.append("staged sidecar is unreadable")
+    plan_path_value = manifest.get("plan_path")
+    if not isinstance(plan_path_value, str) or not Path(plan_path_value).expanduser().resolve().is_file():
+        reasons.append("semantic plan is unavailable")
+    else:
+        try:
+            plan = read_json(Path(plan_path_value).expanduser().resolve())
+            if (
+                plan.get("plan_id") != manifest.get("plan_id")
+                or plan.get("source", {}).get("path") != str(source)
+                or plan.get("candidate", {}).get("sha256") != expected_candidate
+                or plan.get("sidecar", {}).get("sha256") != expected_sidecar
+            ):
+                reasons.append("batch artifacts are not bound to the reviewed semantic plan")
+            expected_session = plan.get("session_id") or source.stem
+            if expected_session != session_id:
+                reasons.append("batch session identity differs from semantic plan")
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            reasons.append("semantic plan is unreadable")
+    current_hash: str | None = None
+    if not source.is_file():
+        reasons.append("source file is unavailable")
+    else:
+        current_hash = sha256_file(source)
+    if reasons:
+        return {**base, "status": "needs_manual_recovery", "reason": "; ".join(reasons), "source_sha256": current_hash}
+    if current_hash == expected_candidate:
+        if manifest.get("status") != "success":
+            manifest["status"] = "verified"
+            manifest["final_sha256"] = current_hash
+            write_manifest(manifest_path, manifest)
+            manifest["status"] = "success"
+            write_manifest(manifest_path, manifest)
+        return {**base, "status": "success", "source_sha256": current_hash}
+    if current_hash == expected_original:
+        if manifest.get("status") == "success":
+            return {**base, "status": "needs_manual_recovery", "reason": "successful batch source no longer has candidate hash"}
+        manifest["status"] = "failed"
+        manifest["error"] = "source remains at the verified original after interruption"
+        write_manifest(manifest_path, manifest)
+        return {**base, "status": "failed", "source_sha256": current_hash}
+    return {
+        **base,
+        "status": "needs_manual_recovery",
+        "reason": "source hash matches neither verified original nor staged candidate",
+        "source_sha256": current_hash,
+        "original_sha256": expected_original,
+        "candidate_sha256": expected_candidate,
+    }
+
+
 def validate_session_path(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if resolved.suffix.lower() != ".jsonl":
@@ -2477,6 +3189,8 @@ def apply_plan(plan_path: Path, confirmation: str, backup_root: Path | None = No
     plan = read_json(plan_path)
     if "plan_set_version" in plan:
         raise ValueError("apply requires one candidate plan, not a plan set")
+    if plan.get("candidate_kind") == "semantic_cleanup" or plan.get("plan_version") == SEMANTIC_PLAN_VERSION:
+        return apply_semantic_plan_document(plan_path, confirmation, backup_root, plan)
     if plan.get("plan_version") != PLAN_VERSION:
         raise ValueError("unsupported plan version; regenerate the plan")
     policy_errors = validate_plan_policy(plan)
