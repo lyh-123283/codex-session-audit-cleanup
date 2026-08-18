@@ -63,7 +63,7 @@ remain unchanged.
 - Add `validate_semantic_operation(operation: Any, record: dict[str, Any],
   raw_line: bytes, protected_from: int) -> list[str]`.
 
-- [ ] **Step 1: Write failing validation tests**
+- [x] **Step 1: Write failing validation tests**
 
 Add tests with these names and behaviors:
 
@@ -161,7 +161,7 @@ def test_semantic_bundle_rejects_stale_call_id_or_node_hash(self):
     assert "source_identity_mismatch" in errors
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail for missing helpers**
+- [x] **Step 2: Run the focused tests and verify they fail for missing helpers**
 
 Run:
 
@@ -172,14 +172,14 @@ pytest tests/test_session_cleanup.py -k semantic_bundle -v
 Expected: collection succeeds and the new tests fail because the semantic
 validation interfaces do not exist.
 
-- [ ] **Step 3: Document the bundle contract**
+- [x] **Step 3: Document the bundle contract**
 
 Write the exact JSON fields for `semantic_map`, `blocks`, `operations`,
 `sidecar`, source identity, and review metadata in
 `references/semantic-bundle-schema.md`. State that model prose is advisory and
 executor-owned identity fields are recomputed.
 
-- [ ] **Step 4: Implement hash and validation primitives**
+- [x] **Step 4: Implement hash and validation primitives**
 
 Implement the interfaces above with standard-library JSON and SHA-256 only.
 Reject missing source lines, duplicate block IDs, duplicate target lines,
@@ -187,7 +187,7 @@ unknown JSON pointers, missing `call_id`, protected/visible records, mixed
 output nodes, and mismatched raw-line/node hashes. Do not mutate records in
 these helpers.
 
-- [ ] **Step 5: Run focused and legacy tests**
+- [x] **Step 5: Run focused and legacy tests**
 
 Run:
 
@@ -198,7 +198,7 @@ pytest -q
 
 Expected: new tests and the existing baseline pass.
 
-- [ ] **Step 6: Commit the validated contract**
+- [x] **Step 6: Commit the validated contract**
 
 ```powershell
 git add references/semantic-bundle-schema.md scripts/session_cleanup.py tests/test_session_cleanup.py

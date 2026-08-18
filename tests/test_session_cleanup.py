@@ -1,4 +1,5 @@
 import json
+import copy
 import os
 import shutil
 import subprocess
@@ -133,6 +134,50 @@ def make_target_session(path):
         write_record(handle, {"type": "compacted", "payload": {"summary": "target boundary"}})
 
 
+def _semantic_fixture(temp_dir):
+    """Create one source-bound text-only semantic cleanup operation."""
+    source = Path(temp_dir) / "semantic-session.jsonl"
+    record = {
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [{"type": "input_text", "text": "old output"}],
+        },
+    }
+    raw = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    source.write_bytes(raw)
+    records, raw_lines, errors = session_cleanup.parse_jsonl(source)
+    assert errors == []
+    rendered_text = "[session cleanup capsule]\nretained: old output"
+    operation = {
+        "block_id": "b-1",
+        "line": 1,
+        "record_index": 0,
+        "call_id": "call-1",
+        "json_pointer": "/payload/output",
+        "source_node_sha256": session_cleanup.hash_json_node(record["payload"]["output"]),
+        "rendered_text": rendered_text,
+    }
+    bundle = {
+        "semantic_map_version": 1,
+        "source": {"sha256": sha256_file(source), "bytes": len(raw)},
+        "blocks": [{"block_id": "b-1", "source_lines": [1, 1], "role": "context"}],
+        "operations": [operation],
+        "sidecar": {"capsule_id": "capsule-1", "rendered_text": rendered_text},
+    }
+    bundle_path = Path(temp_dir) / "semantic-bundle.json"
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    return {
+        "source": source,
+        "records": records,
+        "raw_lines": raw_lines,
+        "protected_from": 99,
+        "bundle": bundle,
+        "bundle_path": bundle_path,
+    }
+
+
 def make_backup_batch(backup_root, session_id, batch_id, created_at):
     batch = Path(backup_root) / session_id / batch_id
     batch.mkdir(parents=True)
@@ -157,6 +202,131 @@ def make_backup_batch(backup_root, session_id, batch_id, created_at):
 
 
 class SessionCleanupTests(unittest.TestCase):
+    def test_semantic_bundle_accepts_source_bound_text_operation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+
+            self.assertEqual(
+                session_cleanup.validate_semantic_bundle(
+                    fixture["bundle"],
+                    fixture["records"],
+                    fixture["raw_lines"],
+                    fixture["protected_from"],
+                ),
+                [],
+            )
+
+    def test_semantic_bundle_rejects_visible_and_protected_operations(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+
+            errors = session_cleanup.validate_semantic_bundle(
+                fixture["bundle"], fixture["records"], fixture["raw_lines"], 1
+            )
+
+            self.assertIn("protected_or_visible_record", errors)
+
+    def test_semantic_bundle_rejects_structured_output_and_wrong_pointer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            structured_records = copy.deepcopy(fixture["records"])
+            structured_records[0]["payload"]["output"].append(
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.invalid/image.png",
+                }
+            )
+
+            errors = session_cleanup.validate_semantic_bundle(
+                fixture["bundle"],
+                structured_records,
+                fixture["raw_lines"],
+                fixture["protected_from"],
+            )
+
+            self.assertTrue(errors)
+
+    def test_semantic_bundle_rejects_stale_call_id_or_node_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            stale_bundle = copy.deepcopy(fixture["bundle"])
+            stale_bundle["operations"][0]["call_id"] = "call-stale"
+
+            errors = session_cleanup.validate_semantic_bundle(
+                stale_bundle,
+                fixture["records"],
+                fixture["raw_lines"],
+                fixture["protected_from"],
+            )
+
+            self.assertIn("source_identity_mismatch", errors)
+
+    def test_semantic_bundle_rejects_malformed_source_without_raising(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            malformed_bundle = copy.deepcopy(fixture["bundle"])
+            malformed_bundle["operations"] = []
+
+            errors = session_cleanup.validate_semantic_bundle(
+                malformed_bundle,
+                [{"__invalid__": True}],
+                fixture["raw_lines"],
+                fixture["protected_from"],
+            )
+
+            self.assertIn("malformed_source_record", errors)
+
+    def test_semantic_bundle_rejects_source_length_mismatch_without_raising(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+
+            errors = session_cleanup.validate_semantic_bundle(
+                fixture["bundle"], fixture["records"], [], fixture["protected_from"]
+            )
+
+            self.assertIn("source_length_mismatch", errors)
+
+    def test_semantic_bundle_rejects_invalid_boundary_and_block_id_without_raising(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            invalid_block_bundle = copy.deepcopy(fixture["bundle"])
+            invalid_block_bundle["operations"][0]["block_id"] = []
+
+            invalid_boundary_errors = session_cleanup.validate_semantic_bundle(
+                fixture["bundle"],
+                fixture["records"],
+                fixture["raw_lines"],
+                None,
+            )
+            invalid_block_errors = session_cleanup.validate_semantic_bundle(
+                invalid_block_bundle,
+                fixture["records"],
+                fixture["raw_lines"],
+                fixture["protected_from"],
+            )
+
+            self.assertIn("invalid_protected_boundary", invalid_boundary_errors)
+            self.assertIn("invalid_block_id", invalid_block_errors)
+
+    def test_semantic_bundle_rejects_non_string_source_call_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            record = copy.deepcopy(fixture["records"][0])
+            record["payload"]["call_id"] = 1
+            raw_line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+            bundle = copy.deepcopy(fixture["bundle"])
+            bundle["source"] = {
+                "sha256": session_cleanup.sha256_bytes(raw_line),
+                "bytes": len(raw_line),
+            }
+            bundle["operations"][0]["call_id"] = "1"
+
+            errors = session_cleanup.validate_semantic_bundle(
+                bundle, [record], [raw_line], fixture["protected_from"]
+            )
+
+            self.assertIn("missing_call_id", errors)
+
     def test_profiles_have_expected_thresholds(self):
         self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)
         self.assertIsNone(session_cleanup.PROFILE_POLICIES["cache"]["max_output_bytes"])

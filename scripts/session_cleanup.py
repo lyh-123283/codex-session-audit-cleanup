@@ -26,6 +26,8 @@ DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_PREFIX_BYTES = 8 * 1024
 DEFAULT_SUFFIX_BYTES = 4 * 1024
 PLAN_VERSION = 3
+SEMANTIC_PLAN_VERSION = 4
+SEMANTIC_AUDIT_VERSION = 3
 BACKUP_VERSION = 1
 PROFILE_POLICIES = {
     "cache": {
@@ -297,6 +299,324 @@ def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], list[bytes], list[dic
             errors.append({"line": line_number, "error": type(exc).__name__, "detail": str(exc)})
             records.append({"__invalid__": True})
     return records, lines, errors
+
+
+def _json_pointer_get(value: Any, pointer: str) -> tuple[bool, Any]:
+    """Resolve an RFC 6901 JSON Pointer without mutating the value."""
+    if pointer == "":
+        return True, value
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        return False, None
+
+    current = value
+    for raw_token in pointer[1:].split("/"):
+        token_parts: list[str] = []
+        index = 0
+        while index < len(raw_token):
+            if raw_token[index] != "~":
+                token_parts.append(raw_token[index])
+                index += 1
+                continue
+            if index + 1 >= len(raw_token) or raw_token[index + 1] not in "01":
+                return False, None
+            token_parts.append("~" if raw_token[index + 1] == "0" else "/")
+            index += 2
+        token = "".join(token_parts)
+
+        if isinstance(current, dict):
+            if token not in current:
+                return False, None
+            current = current[token]
+        elif isinstance(current, list):
+            if not token.isdigit() or (len(token) > 1 and token.startswith("0")):
+                return False, None
+            item_index = int(token)
+            if item_index >= len(current):
+                return False, None
+            current = current[item_index]
+        else:
+            return False, None
+    return True, current
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _append_unique(errors: list[str], code: str) -> None:
+    if code not in errors:
+        errors.append(code)
+
+
+def _raw_line_record(raw_line: bytes) -> tuple[bool, dict[str, Any] | None]:
+    content = raw_line.rstrip(b"\r\n")
+    if not content:
+        return False, None
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, None
+    return isinstance(value, dict), value if isinstance(value, dict) else None
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Serialize JSON for sidecar and metadata hashes.
+
+    This domain is deliberately sorted-key, compact UTF-8 JSON without a
+    trailing newline. It is separate from the source JSONL byte domain.
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def hash_json_node(value: Any) -> str:
+    """Hash a selected JSON node using the compact UTF-8 node domain."""
+    return sha256_bytes(compact_json_bytes(value))
+
+
+def is_semantic_text_output(value: Any) -> bool:
+    """Return whether value matches the first in-place text-only allowlist."""
+    if not isinstance(value, list) or not value:
+        return False
+    return all(
+        isinstance(node, dict)
+        and set(node) == {"type", "text"}
+        and node.get("type") == "input_text"
+        and isinstance(node.get("text"), str)
+        for node in value
+    )
+
+
+def validate_semantic_operation(
+    operation: Any,
+    record: dict[str, Any],
+    raw_line: bytes,
+    protected_from: int,
+) -> list[str]:
+    """Validate one source-bound operation without changing source data."""
+    errors: list[str] = []
+    if not isinstance(operation, dict):
+        return ["invalid_operation"]
+    if not _is_int(protected_from) or protected_from < 1:
+        return ["invalid_protected_boundary"]
+    if not isinstance(raw_line, bytes):
+        return ["invalid_source_line"]
+
+    line = operation.get("line")
+    if not _is_int(line) or line < 1:
+        _append_unique(errors, "invalid_source_line")
+    elif line >= protected_from:
+        _append_unique(errors, "protected_or_visible_record")
+
+    record_index = operation.get("record_index")
+    if not _is_int(record_index) or not _is_int(line) or record_index != line - 1:
+        _append_unique(errors, "source_identity_mismatch")
+
+    if not isinstance(record, dict) or record.get("__invalid__"):
+        _append_unique(errors, "invalid_source_record")
+        return errors
+
+    if is_visible_message(record) or (isinstance(line, int) and line >= protected_from):
+        _append_unique(errors, "protected_or_visible_record")
+    if payload_type(record) not in TOOL_OUTPUT_TYPES:
+        _append_unique(errors, "ineligible_record")
+
+    payload = record.get("payload")
+    actual_call_id = payload.get("call_id") if isinstance(payload, dict) else None
+    declared_call_id = operation.get("call_id")
+    if (
+        not isinstance(actual_call_id, str)
+        or not actual_call_id
+        or not isinstance(declared_call_id, str)
+        or not declared_call_id
+    ):
+        _append_unique(errors, "missing_call_id")
+    elif declared_call_id != actual_call_id:
+        _append_unique(errors, "source_identity_mismatch")
+
+    valid_raw_record, decoded_raw_record = _raw_line_record(raw_line)
+    if not valid_raw_record:
+        _append_unique(errors, "invalid_source_line")
+    elif decoded_raw_record != record:
+        _append_unique(errors, "source_identity_mismatch")
+        _append_unique(errors, "raw_line_record_mismatch")
+
+    declared_line_hash = operation.get("source_line_sha256")
+    if declared_line_hash is not None:
+        if not isinstance(declared_line_hash, str) or declared_line_hash != sha256_bytes(raw_line):
+            _append_unique(errors, "source_identity_mismatch")
+            _append_unique(errors, "source_line_hash_mismatch")
+
+    pointer = operation.get("json_pointer")
+    if not isinstance(pointer, str):
+        _append_unique(errors, "unknown_json_pointer")
+        return errors
+    pointer_exists, selected = _json_pointer_get(record, pointer)
+    if not pointer_exists:
+        _append_unique(errors, "unknown_json_pointer")
+        return errors
+    if pointer != "/payload/output":
+        _append_unique(errors, "unsupported_json_pointer")
+    if not is_semantic_text_output(selected):
+        _append_unique(errors, "structured_output")
+
+    declared_node_hash = operation.get("source_node_sha256")
+    if not isinstance(declared_node_hash, str) or declared_node_hash != hash_json_node(selected):
+        _append_unique(errors, "source_identity_mismatch")
+        _append_unique(errors, "source_node_hash_mismatch")
+
+    rendered_text = operation.get("rendered_text")
+    if not isinstance(rendered_text, str) or not rendered_text:
+        _append_unique(errors, "invalid_rendered_text")
+    replacement_hash = operation.get("replacement_node_sha256")
+    if replacement_hash is not None:
+        replacement = [{"type": "input_text", "text": rendered_text}]
+        if not isinstance(replacement_hash, str) or replacement_hash != hash_json_node(replacement):
+            _append_unique(errors, "replacement_node_hash_mismatch")
+    return errors
+
+
+def validate_semantic_bundle(
+    bundle: Any,
+    source_records: list[dict[str, Any]],
+    raw_lines: list[bytes],
+    protected_from: int,
+) -> list[str]:
+    """Validate a model-produced semantic bundle against source observations."""
+    errors: list[str] = []
+    if not isinstance(bundle, dict):
+        return ["invalid_bundle"]
+    if bundle.get("semantic_map_version") != 1:
+        _append_unique(errors, "unsupported_semantic_map_version")
+    if not _is_int(protected_from) or protected_from < 1:
+        return ["invalid_protected_boundary"]
+
+    if not isinstance(source_records, list) or not isinstance(raw_lines, list):
+        return ["invalid_source_records"]
+
+    source = bundle.get("source")
+    source_bytes = b"".join(raw_lines) if all(isinstance(line, bytes) for line in raw_lines) else None
+    if not isinstance(source, dict):
+        _append_unique(errors, "missing_source_identity")
+    else:
+        if not isinstance(source.get("sha256"), str) or not _is_int(source.get("bytes")):
+            _append_unique(errors, "invalid_source_identity")
+        if source_bytes is None:
+            _append_unique(errors, "source_identity_mismatch")
+        else:
+            if source.get("sha256") != sha256_bytes(source_bytes):
+                _append_unique(errors, "source_identity_mismatch")
+                _append_unique(errors, "source_hash_mismatch")
+            if source.get("bytes") != len(source_bytes):
+                _append_unique(errors, "source_identity_mismatch")
+                _append_unique(errors, "source_size_mismatch")
+
+    if len(source_records) != len(raw_lines):
+        _append_unique(errors, "source_identity_mismatch")
+        _append_unique(errors, "source_length_mismatch")
+        return errors
+    if source_bytes is None:
+        _append_unique(errors, "invalid_source_lines")
+        return errors
+    if any(not isinstance(record, dict) or record.get("__invalid__") for record in source_records):
+        _append_unique(errors, "malformed_source_record")
+        return errors
+
+    blocks = bundle.get("blocks")
+    block_ranges: dict[str, tuple[int, int]] = {}
+    if not isinstance(blocks, list):
+        _append_unique(errors, "invalid_blocks")
+        blocks = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            _append_unique(errors, "invalid_block")
+            continue
+        block_id = block.get("block_id")
+        source_lines = block.get("source_lines")
+        if not isinstance(block_id, str) or not block_id:
+            _append_unique(errors, "invalid_block_id")
+            continue
+        if block_id in block_ranges:
+            _append_unique(errors, "duplicate_block_id")
+            continue
+        if (
+            not isinstance(source_lines, list)
+            or len(source_lines) != 2
+            or not all(_is_int(value) for value in source_lines)
+            or source_lines[0] < 1
+            or source_lines[0] > source_lines[1]
+            or source_lines[1] > len(source_records)
+        ):
+            _append_unique(errors, "invalid_source_lines")
+            continue
+        start, end = source_lines
+        block_ranges[block_id] = (start, end)
+        if end >= protected_from:
+            _append_unique(errors, "protected_block")
+
+    operations = bundle.get("operations")
+    if not isinstance(operations, list):
+        _append_unique(errors, "invalid_operations")
+        operations = []
+    target_lines: set[int] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            _append_unique(errors, "invalid_operation")
+            continue
+        line = operation.get("line")
+        if _is_int(line):
+            if line in target_lines:
+                _append_unique(errors, "duplicate_target_line")
+            target_lines.add(line)
+        block_id = operation.get("block_id")
+        if not isinstance(block_id, str) or not block_id:
+            _append_unique(errors, "invalid_block_id")
+            block_range = None
+        else:
+            block_range = block_ranges.get(block_id)
+        if block_range is None:
+            _append_unique(errors, "unknown_block_id")
+        elif not _is_int(line) or not block_range[0] <= line <= block_range[1]:
+            _append_unique(errors, "operation_outside_block")
+        if not _is_int(line) or line < 1 or line > len(source_records):
+            _append_unique(errors, "source_line_out_of_range")
+            continue
+        errors.extend(
+            code
+            for code in validate_semantic_operation(
+                operation,
+                source_records[line - 1],
+                raw_lines[line - 1],
+                protected_from,
+            )
+            if code not in errors
+        )
+
+    sidecar = bundle.get("sidecar")
+    if not isinstance(sidecar, dict):
+        _append_unique(errors, "missing_sidecar")
+    else:
+        capsule_id = sidecar.get("capsule_id")
+        if not isinstance(capsule_id, str) or not capsule_id:
+            _append_unique(errors, "invalid_sidecar")
+        if len(operations) == 1 and isinstance(sidecar.get("rendered_text"), str):
+            if sidecar["rendered_text"] != operations[0].get("rendered_text"):
+                _append_unique(errors, "sidecar_rendered_text_mismatch")
+
+    semantic_map = bundle.get("semantic_map")
+    if semantic_map is not None:
+        if not isinstance(semantic_map, dict):
+            _append_unique(errors, "invalid_semantic_map")
+        elif isinstance(source, dict) and semantic_map.get("source_sha256") not in {
+            None,
+            source.get("sha256"),
+        }:
+            _append_unique(errors, "source_identity_mismatch")
+    return list(dict.fromkeys(errors))
 
 
 def extract_session_id(records: list[dict[str, Any]]) -> str | None:
