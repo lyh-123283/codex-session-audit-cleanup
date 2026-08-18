@@ -223,7 +223,7 @@ git commit -m "feat: validate semantic cleanup bundles"
   `--bundle`, optional `--codex-home`, `--report-dir`, `--recent-records`,
   and `--recent-compactions`.
 
-- [ ] **Step 1: Write failing materialization tests**
+- [x] **Step 1: Write failing materialization tests**
 
 Add tests with these names:
 
@@ -268,7 +268,7 @@ def test_semantic_plan_blocks_when_no_safe_operation_exists(self):
     assert plan["status"] in {"blocked", "no_change"}
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail**
+- [x] **Step 2: Run the focused tests and verify they fail**
 
 ```powershell
 pytest tests/test_session_cleanup.py -k "materialize or semantic_plan" -v
@@ -276,7 +276,7 @@ pytest tests/test_session_cleanup.py -k "materialize or semantic_plan" -v
 
 Expected: failures for missing materialization and CLI integration.
 
-- [ ] **Step 3: Implement deterministic capsule rendering**
+- [x] **Step 3: Implement deterministic capsule rendering**
 
 Render only the already-approved text into a list containing one
 `{"type":"input_text","text": ...}` node. Preserve all outer record fields,
@@ -284,7 +284,7 @@ line endings for unchanged lines, and the `payload` fields outside
 `/payload/output`. Copy the sidecar bundle into the report directory with a
 content digest; do not add a new JSONL record.
 
-- [ ] **Step 4: Implement semantic plan creation**
+- [x] **Step 4: Implement semantic plan creation**
 
 Load and validate the bundle, inspect the source, calculate the protected
 region, materialize the candidate, and write a plan containing `plan_version:
@@ -292,14 +292,14 @@ region, materialize the candidate, and write a plan containing `plan_version:
 `semantic_map`, sidecar fingerprint, operations, compatibility evidence,
 review requirements, and block-level retained/omitted explanations.
 
-- [ ] **Step 5: Add and test the `semantic-plan` CLI route**
+- [x] **Step 5: Add and test the `semantic-plan` CLI route**
 
 Wire parser and `main()` without changing legacy `plan` behavior. Return exit
 code 0 only for a reviewable semantic candidate or an explicit no-change
 result; return 2 for blocked validation. Test the command through `main()` with
 temporary JSONL and bundle files.
 
-- [ ] **Step 6: Update the schema reference and run tests**
+- [x] **Step 6: Update the schema reference and run tests**
 
 Document that semantic candidates alter only eligible `payload.output` nodes,
 while sidecar data stays outside canonical JSONL. Run:
@@ -309,7 +309,7 @@ pytest tests/test_session_cleanup.py -k "semantic or plan" -v
 pytest -q
 ```
 
-- [ ] **Step 7: Commit the candidate materializer**
+- [x] **Step 7: Commit the candidate materializer**
 
 ```powershell
 git add scripts/session_cleanup.py references/jsonl-schema.md tests/test_session_cleanup.py

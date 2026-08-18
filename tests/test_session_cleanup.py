@@ -145,7 +145,18 @@ def _semantic_fixture(temp_dir):
             "output": [{"type": "input_text", "text": "old output"}],
         },
     }
-    raw = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    first_line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    filler_lines = [
+        (
+            json.dumps(
+                {"type": "event_msg", "payload": {"text": f"filler-{index}"}},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        for index in range(1000)
+    ]
+    raw = b"".join([first_line, *filler_lines])
     source.write_bytes(raw)
     records, raw_lines, errors = session_cleanup.parse_jsonl(source)
     assert errors == []
@@ -266,10 +277,12 @@ class SessionCleanupTests(unittest.TestCase):
             fixture = _semantic_fixture(Path(temp_dir))
             malformed_bundle = copy.deepcopy(fixture["bundle"])
             malformed_bundle["operations"] = []
+            malformed_records = copy.deepcopy(fixture["records"])
+            malformed_records[0] = {"__invalid__": True}
 
             errors = session_cleanup.validate_semantic_bundle(
                 malformed_bundle,
-                [{"__invalid__": True}],
+                malformed_records,
                 fixture["raw_lines"],
                 fixture["protected_from"],
             )
@@ -326,6 +339,120 @@ class SessionCleanupTests(unittest.TestCase):
             )
 
             self.assertIn("missing_call_id", errors)
+
+    def test_materialize_semantic_candidate_replaces_only_declared_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            candidate = Path(temp_dir) / "candidate.jsonl"
+
+            result = session_cleanup.materialize_semantic_candidate(
+                fixture["source"],
+                candidate,
+                fixture["bundle"],
+                fixture["records"],
+                fixture["raw_lines"],
+                2,
+            )
+            candidate_records, candidate_lines, errors = session_cleanup.parse_jsonl(candidate)
+
+            self.assertEqual(result["changed_records"], 1)
+            self.assertEqual(errors, [])
+            self.assertEqual(candidate_records[0]["payload"]["call_id"], "call-1")
+            self.assertEqual(
+                candidate_records[0]["payload"]["output"],
+                [{"type": "input_text", "text": fixture["bundle"]["operations"][0]["rendered_text"]}],
+            )
+            self.assertEqual(candidate_lines[1:], fixture["raw_lines"][1:])
+
+    def test_materialize_semantic_candidate_preserves_classic_mac_line_ending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = _semantic_fixture(Path(temp_dir))
+            fixture["source"].write_bytes(fixture["source"].read_bytes().replace(b"\n", b"\r"))
+            records, raw_lines, errors = session_cleanup.parse_jsonl(fixture["source"])
+            self.assertEqual(errors, [])
+            fixture["records"] = records
+            fixture["raw_lines"] = raw_lines
+            fixture["bundle"]["source"] = {
+                "sha256": sha256_file(fixture["source"]),
+                "bytes": fixture["source"].stat().st_size,
+            }
+            candidate = Path(temp_dir) / "candidate-cr.jsonl"
+
+            session_cleanup.materialize_semantic_candidate(
+                fixture["source"],
+                candidate,
+                fixture["bundle"],
+                records,
+                raw_lines,
+                2,
+            )
+
+            candidate_bytes = candidate.read_bytes()
+            first_candidate_line, first_separator, _ = candidate_bytes.partition(b"\r")
+            self.assertEqual(first_separator, b"\r")
+            self.assertIn(b"retained: old output", first_candidate_line)
+
+    def test_semantic_plan_contains_sidecar_and_v4_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root)
+
+            plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "reports", fixture["bundle_path"], 1000, 2
+            )
+
+            self.assertEqual(plan["plan_version"], 4)
+            self.assertEqual(plan["audit_version"], 3)
+            self.assertEqual(plan["candidate_kind"], "semantic_cleanup")
+            self.assertEqual(plan["status"], "ready_for_review")
+            self.assertIn("semantic_map_digest", plan)
+            self.assertIn("sidecar", plan)
+            self.assertTrue(Path(plan["sidecar"]["path"]).is_file())
+            self.assertEqual(plan["summary"]["changed_records"], 1)
+
+    def test_semantic_plan_has_no_change_when_no_safe_operation_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root)
+            unsafe_bundle = copy.deepcopy(fixture["bundle"])
+            unsafe_bundle["operations"] = []
+            unsafe_bundle_path = root / "unsafe-bundle.json"
+            unsafe_bundle_path.write_text(json.dumps(unsafe_bundle), encoding="utf-8")
+
+            plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "reports", unsafe_bundle_path, 1000, 2
+            )
+
+            self.assertIn(plan["status"], {"no_change", "blocked"})
+            self.assertEqual(plan["summary"]["changed_records"], 0)
+
+    def test_semantic_plan_cli_route_returns_reviewable_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root)
+            command = [sys.executable, str(SCRIPT_DIR / "session_cleanup.py")]
+            process = subprocess.run(
+                command
+                + [
+                    "semantic-plan",
+                    str(fixture["source"]),
+                    "--bundle",
+                    str(fixture["bundle_path"]),
+                    "--report-dir",
+                    str(root / "reports"),
+                    "--recent-records",
+                    "1000",
+                    "--recent-compactions",
+                    "2",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            plan = json.loads(process.stdout)
+            self.assertEqual(plan["candidate_kind"], "semantic_cleanup")
 
     def test_profiles_have_expected_thresholds(self):
         self.assertEqual(session_cleanup.DEFAULT_RECENT_COMPACTIONS, 2)

@@ -373,6 +373,17 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def write_canonical_json(path: Path, value: Any) -> None:
+    """Write canonical JSON without a trailing newline and fsync it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = canonical_json_bytes(value)
+    with path.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    fsync_directory(path.parent)
+
+
 def hash_json_node(value: Any) -> str:
     """Hash a selected JSON node using the compact UTF-8 node domain."""
     return sha256_bytes(compact_json_bytes(value))
@@ -1167,6 +1178,103 @@ def write_candidate(
     }
 
 
+def normalize_rendered_text(rendered_text: str) -> str:
+    if not isinstance(rendered_text, str):
+        raise ValueError("rendered_text must be a string")
+    return rendered_text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def render_capsule_node(rendered_text: str) -> list[dict[str, str]]:
+    """Render reviewed capsule text into the existing text-node shape."""
+    normalized = normalize_rendered_text(rendered_text)
+    if not normalized:
+        raise ValueError("rendered_text must not be empty")
+    return [{"type": "input_text", "text": normalized}]
+
+
+def _line_ending(raw_line: bytes) -> bytes:
+    if raw_line.endswith(b"\r\n"):
+        return b"\r\n"
+    if raw_line.endswith(b"\n"):
+        return b"\n"
+    if raw_line.endswith(b"\r"):
+        return b"\r"
+    return b""
+
+
+def materialize_semantic_candidate(
+    source: Path,
+    candidate: Path,
+    bundle: dict[str, Any],
+    records: list[dict[str, Any]],
+    raw_lines: list[bytes],
+    protected_from: int,
+) -> dict[str, Any]:
+    """Replay a validated semantic bundle into a candidate JSONL file."""
+    source = validate_session_path(source)
+    source_bytes = source.read_bytes()
+    supplied_bytes = b"".join(raw_lines) if all(isinstance(line, bytes) for line in raw_lines) else None
+    if supplied_bytes is None or supplied_bytes != source_bytes:
+        raise ValueError("source changed before semantic candidate materialization")
+    validation_errors = validate_semantic_bundle(bundle, records, raw_lines, protected_from)
+    if validation_errors:
+        raise ValueError("invalid semantic bundle: " + "; ".join(validation_errors))
+
+    operations_by_line = {
+        int(operation["line"]): operation for operation in bundle.get("operations", [])
+    }
+    candidate_lines: list[bytes] = []
+    changed_lines: list[dict[str, Any]] = []
+    bytes_saved = 0
+    for line_number, (record, raw_line) in enumerate(zip(records, raw_lines), start=1):
+        operation = operations_by_line.get(line_number)
+        if operation is None:
+            candidate_lines.append(raw_line)
+            continue
+        updated = copy.deepcopy(record)
+        rendered_node = render_capsule_node(operation["rendered_text"])
+        updated["payload"]["output"] = rendered_node
+        content = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        changed = content + _line_ending(raw_line)
+        candidate_lines.append(changed)
+        bytes_saved += len(raw_line) - len(changed)
+        changed_lines.append(
+            {
+                "line": line_number,
+                "record_index": operation["record_index"],
+                "block_id": operation["block_id"],
+                "payload_type": payload_type(record),
+                "call_id": operation["call_id"],
+                "json_pointer": operation["json_pointer"],
+                "original_bytes": len(raw_line),
+                "candidate_bytes": len(changed),
+                "original_sha256": sha256_bytes(raw_line),
+                "candidate_sha256": sha256_bytes(changed),
+                "source_node_sha256": operation["source_node_sha256"],
+                "replacement_node_sha256": hash_json_node(rendered_node),
+                "rendered_text_sha256": sha256_bytes(
+                    normalize_rendered_text(operation["rendered_text"]).encode("utf-8")
+                ),
+            }
+        )
+
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    data = b"".join(candidate_lines)
+    with candidate.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    fsync_directory(candidate.parent)
+    return {
+        "candidate_lines": candidate_lines,
+        "changed_lines": changed_lines,
+        "changed_records": len(changed_lines),
+        "bytes_saved": bytes_saved,
+        "candidate_bytes": len(data),
+        "compatibility_profile": "text_only_v1",
+    }
+
+
 def build_residual_risk(
     requested_profile: str,
     policy: dict[str, Any],
@@ -1481,6 +1589,192 @@ def build_plan(
         plan["summary"],
         plan["status"],
     )
+    plan["plan_digest"] = self_digest(plan, "plan_digest")
+    write_json(Path(plan["report_path"]), plan)
+    return plan
+
+
+def build_semantic_residual_risk(
+    status: str,
+    operations: list[dict[str, Any]],
+    protected_region: dict[str, Any],
+) -> dict[str, Any]:
+    if status == "blocked":
+        items = ["semantic validation or source safety checks blocked in-place mutation"]
+        level = "blocked"
+    elif not operations:
+        items = ["no safe semantic compression operation was selected"]
+        level = "low"
+    else:
+        items = [
+            "capsules retain reviewed facts but omit raw details declared by the semantic bundle",
+            "the original output remains recoverable only from the verified apply backup",
+            "only old text-only tool-output nodes outside the protected region are eligible",
+        ]
+        level = "moderate"
+    items.append("protected recent records, visible messages, call IDs, and unknown structures remain unchanged")
+    return {
+        "profile": "semantic",
+        "level": level,
+        "items": items,
+        "protected_from_line": protected_region.get("from_line"),
+        "selected_boundary_lines": list(protected_region.get("selected_boundary_lines", [])),
+        "mitigation": "apply creates a byte-for-byte original backup before replacement",
+    }
+
+
+def build_semantic_plan(
+    source: Path,
+    report_dir: Path,
+    bundle_path: Path,
+    recent_records: int = DEFAULT_RECENT_RECORDS,
+    recent_compactions: int = DEFAULT_RECENT_COMPACTIONS,
+) -> dict[str, Any]:
+    """Create a v4 semantic candidate from a validated bundle."""
+    validate_cleanup_options(
+        recent_records,
+        DEFAULT_MAX_OUTPUT_BYTES,
+        DEFAULT_PREFIX_BYTES,
+        DEFAULT_SUFFIX_BYTES,
+        recent_compactions,
+    )
+    source = validate_session_path(source)
+    bundle_path = bundle_path.expanduser().resolve()
+    report_dir = report_dir.expanduser().resolve()
+    bundle = read_json(bundle_path)
+    records, raw_lines, parse_errors = parse_jsonl(source)
+    if not records:
+        parse_errors.append({"line": 0, "error": "empty_session"})
+    source_snapshot = fingerprint(source)
+    stats = collect_stats(source, records, parse_errors)
+    protected_region = boundary_metadata(records, recent_records, recent_compactions)
+    protected_from = protected_region["from_line"]
+    bundle_errors = validate_semantic_bundle(bundle, records, raw_lines, protected_from)
+    safety_errors = [
+        f"source line {item.get('line', 0)}: {item.get('error', 'invalid source')}"
+        for item in parse_errors
+    ] + bundle_errors
+    locks = find_locks(source)
+    if locks:
+        safety_errors.append("writer_lock_detected")
+
+    plan_id = uuid.uuid4().hex
+    candidate = report_dir / f"candidate-{plan_id}.jsonl"
+    sidecar_path = report_dir / f"semantic-sidecar-{plan_id}.json"
+    write_canonical_json(sidecar_path, bundle)
+    sidecar_snapshot = fingerprint(sidecar_path)
+    bundle_snapshot = fingerprint(bundle_path)
+
+    if safety_errors:
+        copy_file_fsync(source, candidate)
+        transformation = {
+            "changed_lines": [],
+            "changed_records": 0,
+            "bytes_saved": 0,
+            "candidate_bytes": candidate.stat().st_size,
+            "compatibility_profile": "text_only_v1",
+        }
+    else:
+        transformation = materialize_semantic_candidate(
+            source,
+            candidate,
+            bundle,
+            records,
+            raw_lines,
+            protected_from,
+        )
+    candidate_snapshot = fingerprint(candidate)
+    operations = copy.deepcopy(bundle.get("operations", [])) if isinstance(bundle.get("operations"), list) else []
+    blocks = copy.deepcopy(bundle.get("blocks", [])) if isinstance(bundle.get("blocks"), list) else []
+    semantic_map = copy.deepcopy(bundle.get("semantic_map"))
+    if not isinstance(semantic_map, dict):
+        semantic_map = {
+            "semantic_map_version": bundle.get("semantic_map_version"),
+            "source_sha256": source_snapshot["sha256"],
+            "blocks": blocks,
+        }
+    status = "blocked" if safety_errors else (
+        "ready_for_review" if transformation["changed_records"] else "no_change"
+    )
+    plan = {
+        "plan_version": SEMANTIC_PLAN_VERSION,
+        "audit_version": SEMANTIC_AUDIT_VERSION,
+        "plan_id": plan_id,
+        "candidate_kind": "semantic_cleanup",
+        "requested_profile": str(bundle.get("candidate_profile", "semantic_conservative")),
+        "status": status,
+        "created_at": utc_now(),
+        "source": source_snapshot,
+        "candidate": candidate_snapshot,
+        "candidate_path": str(candidate),
+        "report_path": str(report_dir / f"plan-{plan_id}.json"),
+        "audit_path": str(report_dir / f"audit-{plan_id}.json"),
+        "session_id": stats["session_id"],
+        "source_stats": stats,
+        "intent_profile": build_intent_profile(stats),
+        "semantic_intent": copy.deepcopy(bundle.get("intent")),
+        "semantic_map": semantic_map,
+        "semantic_map_digest": sha256_bytes(canonical_json_bytes(semantic_map)),
+        "bundle": {
+            "path": str(bundle_path),
+            "fingerprint": bundle_snapshot,
+        },
+        "sidecar": {
+            **sidecar_snapshot,
+            "canonical_json": True,
+            "source_bundle_path": str(bundle_path),
+        },
+        "operations": operations,
+        "blocks": blocks,
+        "semantic_review": copy.deepcopy(bundle.get("semantic_review", {})),
+        "compatibility": {
+            "profile": "text_only_v1",
+            "record_types": sorted(TOOL_OUTPUT_TYPES),
+            "json_pointer": "/payload/output",
+            "renderer": "single_input_text_node",
+            "changed_records": transformation["changed_records"],
+        },
+        "policy": {
+            "profile": "semantic",
+            "compatibility_profile": "text_only_v1",
+            "preserve_protected_region": True,
+            "preserve_visible_messages": True,
+        },
+        "locks": locks,
+        "protected_region": {
+            **protected_region,
+            "rules": [
+                "preserve all records from the selected logical compaction boundary",
+                "preserve all user and assistant visible messages byte-for-byte",
+                "preserve all non-tool-output records and tool call IDs",
+                "preserve unknown, structured, code, JSON, patch, and unique-evidence content",
+            ],
+        },
+        "transformation": {
+            "semantic": True,
+            "candidate_kind": "semantic_cleanup",
+            "compatibility_profile": "text_only_v1",
+            "changed_lines": transformation["changed_lines"],
+            "operations": operations,
+        },
+        "summary": {
+            "original_bytes": source_snapshot["size"],
+            "candidate_bytes": transformation["candidate_bytes"],
+            "bytes_saved": transformation.get("bytes_saved", 0),
+            "changed_records": transformation["changed_records"],
+            "operations": len(operations),
+        },
+        "review_requirements": [
+            "planner and independent critic artifacts must be present before audit",
+            "semantic audit must pass all ordered v3 stages",
+            "source SHA-256 and sidecar digest must still match at apply time",
+            "an explicit confirmation equal to plan_id is required",
+            "a byte-level backup must be verified before replacement",
+        ],
+    }
+    if safety_errors:
+        plan["blocking_reasons"] = safety_errors
+    plan["residual_risk"] = build_semantic_residual_risk(status, operations, plan["protected_region"])
     plan["plan_digest"] = self_digest(plan, "plan_digest")
     write_json(Path(plan["report_path"]), plan)
     return plan
@@ -3003,6 +3297,18 @@ def build_parser() -> argparse.ArgumentParser:
                 choices=("recent_content", "visible_messages", "user_images", "structural_fidelity"),
             )
             sub.add_argument("--allowed-strength", choices=("cache", "balanced", "space"))
+    semantic_plan = subparsers.add_parser("semantic-plan")
+    semantic_plan.add_argument("target")
+    semantic_plan.add_argument("--bundle", type=Path, required=True)
+    semantic_plan.add_argument("--codex-home", type=Path)
+    semantic_plan.add_argument("--report-dir", type=Path, default=Path.cwd() / "session-cleanup-reports")
+    semantic_plan.add_argument("--recent-records", type=int, default=DEFAULT_RECENT_RECORDS)
+    semantic_plan.add_argument(
+        "--recent-compactions",
+        type=int,
+        default=DEFAULT_RECENT_COMPACTIONS,
+        help="preserve from this many latest logical compaction boundaries",
+    )
     audit = subparsers.add_parser("audit")
     audit.add_argument("plan", type=Path)
     apply = subparsers.add_parser("apply")
@@ -3074,6 +3380,17 @@ def main(argv: list[str] | None = None) -> int:
                     intent_profile=intent,
                     target_bytes=args.target_bytes,
                 )
+            print_json(plan)
+            return 0 if plan["status"] in {"ready_for_review", "no_change"} else 2
+        elif args.command == "semantic-plan":
+            source = resolve_target(args.target, args.codex_home)
+            plan = build_semantic_plan(
+                source,
+                args.report_dir,
+                args.bundle,
+                args.recent_records,
+                args.recent_compactions,
+            )
             print_json(plan)
             return 0 if plan["status"] in {"ready_for_review", "no_change"} else 2
         elif args.command == "audit":

@@ -135,6 +135,32 @@ boundary lines. It is review metadata, not a model-generated summary.
 call IDs, reasons, and byte effects. `protected_region` contains the selected
 boundary metadata and preservation rules.
 
+## Semantic Candidate Plan: Version 4
+
+The `semantic-plan` command consumes one validated semantic bundle and writes a
+plan with `plan_version: 4`, `audit_version: 3`, and
+`candidate_kind: semantic_cleanup`. It records the recomputed `semantic_map`
+and `semantic_map_digest`, source-bound `operations`, block decisions,
+compatibility evidence, planner/critic review metadata, and a canonical JSON
+`sidecar` fingerprint. The sidecar is stored beside the plan and is not added
+to the session JSONL.
+
+The first in-place compatibility profile is `text_only_v1`. Every changed
+line must be an old `custom_tool_call_output` or `function_call_output` outside
+the executor-calculated protected region, and the only changed JSON Pointer is
+`/payload/output`. Its replacement is one existing `input_text` node. All
+other lines retain their original bytes and line endings. Visible messages,
+tool calls, call IDs, compaction records, user images, unknown structures, and
+structured/code/JSON/patch/unique-evidence output remain unchanged or block the
+candidate.
+
+The semantic plan status is `ready_for_review`, `no_change`, or `blocked`.
+`no_change` is an explicit successful analysis result with zero operations; it
+does not authorize apply. A blocked plan contains `blocking_reasons` and is
+never eligible for audit/apply. The canonical source is still the only
+recovery source; the sidecar provides provenance and cannot reconstruct
+omitted output.
+
 ## Plan Set: Version 1
 
 When `plan` is called without `--profile` or manual thresholds, it creates:
@@ -173,6 +199,13 @@ checks, errors, audit_digest
 `stages` contains the four independently checked stages:
 `schema`, `policy`, `deterministic_transform`, and `integrity`. Each stage
 records an input digest and result digest and must pass.
+
+Semantic candidates use `audit_version: 3` and five ordered stages:
+`schema`, `semantic_review`, `policy`, `deterministic_transform`, and
+`integrity`. The semantic review stage binds the independent planner/critic
+artifacts and capsule text; the deterministic stage replays the exact
+text-node renderer. A semantic audit or apply must reject legacy four-stage
+audits, and a legacy plan must reject the semantic five-stage audit shape.
 
 Plan-set audits use `plan_set_audit_version: 1` and contain:
 
