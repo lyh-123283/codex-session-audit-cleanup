@@ -5,4 +5,5 @@ session-cleanup-reports/
 session-cleanup-backups/
 reports/
 backups/
+.worktrees/
 *.jsonl.bak*
