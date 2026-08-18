@@ -193,6 +193,54 @@ The four audit stages are:
 Every stage records input and result digests. `apply` repeats the same checks
 and rejects stale or tampered plan, candidate, source, or audit artifacts.
 
+### Semantic value workflow
+
+The legacy profiles are deliberately mechanical. When the desired result is
+value-based reduction, use the separate semantic workflow:
+
+```text
+Understand -> Group -> Compare -> Confirm
+```
+
+`Understand` inspects the target and identifies what must remain. `Group`
+creates source-bound work blocks with retained facts, omitted categories,
+reconstructability, dependency, and proposed action. `Compare` requires a
+planner plus an independent critic with separate review artifacts; unresolved
+disagreement or uncertain evidence blocks the candidate. At most three
+semantic candidates should be shown to the user, and each must have its own
+plan and audit. `Confirm` displays the exact change list, capsule text,
+digests, protected region, and residual risk, then accepts only the exact
+`plan_id`.
+
+The executor currently supports the `text_only_v1` compatibility profile. It
+only materializes old, non-protected tool-output records whose output is a
+plain text-node list. The canonical record shape remains intact; the reviewed
+capsule is stored in a canonical sidecar beside the plan, never appended to
+the session JSONL. The source JSONL and its byte-for-byte backup remain the
+authoritative recovery sources.
+
+Create, audit, and apply one semantic candidate as follows:
+
+```powershell
+python scripts/session_cleanup.py semantic-plan "<target>" `
+  --bundle ".\semantic-bundle.json" `
+  --recent-compactions 2 `
+  --report-dir ".\session-cleanup-reports"
+
+python scripts/session_cleanup.py audit ".\session-cleanup-reports\plan-<plan-id>.json"
+
+python scripts/session_cleanup.py apply `
+  ".\session-cleanup-reports\plan-<plan-id>.json" `
+  --confirm "<plan-id>" --backup-root ".\session-cleanup-backups"
+```
+
+This creates `candidate_kind: semantic_cleanup`, `audit_version: 3`, and a
+sidecar fingerprint. The semantic audit has five ordered stages:
+`schema`, `semantic_review`, `policy`, `deterministic_transform`, and
+`integrity`. `blocked` and `no_change` are non-applicable report states.
+The existing four-stage path remains the legacy policy workflow; its audit
+cannot be reused for a semantic plan.
+
 ### 4. Select and apply one candidate
 
 Review every candidate's profile, status, exact `plan_id`, source hash, audit
@@ -215,6 +263,12 @@ Before replacement, the helper creates and verifies an original backup, writes
 through a same-volume temporary file, atomically replaces the source, and
 checks the final candidate SHA-256. A failure leaves a failed manifest and
 attempts to restore the original. The active runtime context remains unchanged.
+
+Semantic apply also stages `sidecar.json` and `candidate.jsonl` in the backup
+batch. Its status checkpoints are `new`, `backup_verified`, `sidecar_staged`,
+`candidate_staged`, `source_replaced`, `verified`, and `success`. If rollback or
+artifact reconciliation cannot be verified, the batch is reported as
+`needs_manual_recovery`; the tool never guesses which version to keep.
 
 ## Backup Management
 

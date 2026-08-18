@@ -18,9 +18,11 @@ does not shrink a context already loaded into a running request.
   files, lock files, or a file that has a writer lock.
 - Never edit the active runtime context. The source of truth for this skill is
   the selected JSONL file on disk.
-- Use this workflow exactly:
-  `inspect -> intent profile -> plan-set or candidate plans -> independent audit
-  -> user selects exact candidate -> apply`.
+- Use one of these workflows exactly:
+  - legacy policy cleanup: `inspect -> intent profile -> plan-set or candidate
+    plans -> independent audit -> user selects exact candidate -> apply`;
+  - semantic value cleanup: `inspect -> Understand -> Group -> Compare ->
+    Confirm -> semantic-plan -> independent semantic audit -> apply`.
 - Do not treat approval of a general strategy as approval of a plan. Require
   the exact current `plan_id` for `apply`.
 - Bind every plan and audit to source, candidate, plan, and audit digests. If
@@ -103,6 +105,82 @@ recent logical `compacted`/`context_compacted` boundaries onward. If fewer
 boundaries exist, use the available boundaries and the recent-record fallback
 (default `1000`). The plan and every audit record the selected boundary lines.
 
+### 2A. Semantic value cleanup
+
+Use this path when the goal is to reduce low-value historical material by its
+meaning and reconstructability, rather than by age alone. It is separate from
+the legacy byte-policy profiles.
+
+#### Understand
+
+Inspect the target first and state the actual pressure, the recent-content
+retention requirement, the protected compaction boundaries, and the evidence
+for any proposed reduction. The source JSONL remains unchanged while this
+analysis is performed.
+
+#### Group
+
+Partition eligible old tool-output material into source-bound work blocks. For
+each block record its role, retained facts, omitted categories,
+reconstructability, later dependency, confidence, and proposed action. Bind
+every operation to its one-based line, record index, call ID, JSON Pointer, and
+source node hash. A semantic bundle is analysis input, not a new session record.
+
+#### Compare
+
+Have a planner produce the semantic bundle and a separate independent critic
+review the same evidence. The critic must have a distinct artifact and input
+context; it must check protected boundaries, visible messages, unique evidence,
+structured output, call IDs, and whether the proposed capsule is faithful.
+Unresolved disagreement, uncertainty, or unsupported structure is a hard stop.
+When several semantic strengths are prepared, show at most three candidates;
+each candidate must be materialized and audited independently. The executor's
+`semantic-plan` command accepts one bundle per invocation.
+
+#### Confirm
+
+Show the user the block decisions, exact changed lines and call IDs, rendered
+capsule text, source/candidate/sidecar hashes, byte savings, protected content,
+residual risk, and backup/recovery behavior. Ask for the exact current
+`plan_id`, not a general approval. Only a `ready_for_review` candidate with a
+passing semantic audit may proceed.
+
+Materialize one reviewed bundle as a semantic candidate:
+
+```powershell
+python scripts/session_cleanup.py semantic-plan "<same-target>" `
+  --bundle ".\semantic-bundle.json" `
+  --recent-compactions 2 `
+  --report-dir ".\session-cleanup-reports"
+```
+
+The command writes a `plan_version: 4` plan with `candidate_kind:
+semantic_cleanup`, `audit_version: 3`, a canonical sidecar, and a candidate
+JSONL. The sidecar preserves semantic provenance beside the plan; it is never
+appended to the session and cannot reconstruct omitted raw output. In the
+current `text_only_v1` compatibility profile, only an old tool-output record
+outside the protected region whose output is a list of plain `input_text`
+nodes may change. The candidate replaces that output with one reviewed text
+node while preserving the surrounding record, line count, call ID, and line
+ending. Visible messages, user images, structured/code/JSON/patch output,
+unknown structures, and unique or ambiguous evidence remain unchanged or block
+the plan.
+
+Audit and apply the exact semantic plan:
+
+```powershell
+python scripts/session_cleanup.py audit ".\session-cleanup-reports\plan-<plan-id>.json"
+python scripts/session_cleanup.py apply `
+  ".\session-cleanup-reports\plan-<plan-id>.json" `
+  --confirm "<plan-id>" --backup-root ".\session-cleanup-backups"
+```
+
+Semantic audit uses five ordered stages: `schema`, `semantic_review`, `policy`,
+`deterministic_transform`, and `integrity`. A semantic plan, bundle, sidecar,
+candidate, source, or audit digest mismatch requires regeneration and a new
+confirmation. `blocked` and `no_change` semantic plans are report-only and
+cannot be applied.
+
 ### 3. Enforce the transformation boundary
 
 Always preserve:
@@ -136,7 +214,7 @@ python scripts/session_cleanup.py audit "<plan-or-plan-set-json>"
 
 For a plan-set, the command independently audits every candidate, writes each
 candidate audit, and updates the plan-set audit metadata. For one candidate it
-writes one audit document. The four named stages are:
+writes one audit document. A legacy policy candidate has four named stages:
 
 1. `schema`: source and candidate are valid UTF-8 JSONL objects;
 2. `policy`: only allowed old tool-output lines changed and protected content
@@ -149,6 +227,14 @@ writes one audit document. The four named stages are:
 Each stage records input and result digests. `apply` reruns the same stages and
 rejects missing, reordered, stale, or tampered results. An audit failure
 invalidates the plan; do not edit a candidate to force a pass.
+
+A semantic candidate has five stages in this exact order:
+`schema`, `semantic_review`, `policy`, `deterministic_transform`, and
+`integrity`. The `semantic_review` stage rechecks the canonical sidecar,
+source-bound operations, planner artifact, and independent critic artifact;
+the deterministic stage replays the reviewed text renderer. A four-stage
+legacy audit cannot authorize a semantic plan, and a five-stage semantic audit
+cannot authorize a legacy plan.
 
 ### 5. Show, select, and apply
 
@@ -176,6 +262,15 @@ against a fresh audit, creates the original backup, performs an atomic
 same-volume replace, and verifies the final candidate hash. Report the backup
 ID, backup path, final hash, and post-write status. Never silently retry against
 a changed source.
+
+For semantic apply, the backup batch also stages the reviewed `sidecar.json` and
+`candidate.jsonl`. Its manifest advances through
+`new -> backup_verified -> sidecar_staged -> candidate_staged ->
+source_replaced -> verified -> success`. Any failed verification stops the
+operation; if rollback cannot be verified, report `needs_manual_recovery` and
+do not guess which artifact is authoritative. Reconciliation must verify batch
+identity, plan, original backup, staged candidate, staged sidecar, and hashes
+before changing a manifest state.
 
 Plans with `plan_version: 2` or any older version are stale and must be
 regenerated.

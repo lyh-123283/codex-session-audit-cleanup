@@ -245,6 +245,26 @@ JSONL parseability to receive `integrity: valid`. Failed/non-success batches
 use `not_checked`; unreadable or incomplete batches are `unknown` and remain
 protected.
 
+Semantic apply batches additionally set `semantic: true` and stage the reviewed
+`candidate.jsonl` and canonical `sidecar.json`. Their manifest is checkpointed
+in this order:
+
+```text
+new -> backup_verified -> sidecar_staged -> candidate_staged
+    -> source_replaced -> verified -> success
+```
+
+`backup_verified` means `original.jsonl` is byte-for-byte equal to the reviewed
+source. `sidecar_staged` and `candidate_staged` mean their hashes match the
+reviewed plan before replacement. `source_replaced` records the post-replace
+source hash; `verified` checks the candidate, original backup, and sidecar
+again before the final `success` state. A failed operation is retained with
+`failed` when the source is safely restored. If rollback or reconciliation
+cannot verify the original, candidate, sidecar, plan identity, or source hash,
+the durable state is `needs_manual_recovery`; automated cleanup and guessing
+are prohibited. The sidecar is provenance only and cannot reconstruct omitted
+source output.
+
 ## Cleanup Preview: Version 2
 
 `backups cleanup` and the compatibility alias `backups prune` first write a

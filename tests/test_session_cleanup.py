@@ -134,18 +134,29 @@ def make_target_session(path):
         write_record(handle, {"type": "compacted", "payload": {"summary": "target boundary"}})
 
 
-def _semantic_fixture(temp_dir):
-    """Create one source-bound text-only semantic cleanup operation."""
+def _semantic_fixture(temp_dir, operation_count=1):
+    """Create source-bound text-only semantic cleanup operations."""
     source = Path(temp_dir) / "semantic-session.jsonl"
-    record = {
-        "type": "response_item",
-        "payload": {
-            "type": "custom_tool_call_output",
-            "call_id": "call-1",
-            "output": [{"type": "input_text", "text": "old output"}],
-        },
-    }
-    first_line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    first_records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": f"call-{index + 1}",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "old output" if index == 0 else f"old output {index + 1}",
+                    }
+                ],
+            },
+        }
+        for index in range(operation_count)
+    ]
+    first_lines = [
+        (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        for record in first_records
+    ]
     filler_lines = [
         (
             json.dumps(
@@ -156,26 +167,40 @@ def _semantic_fixture(temp_dir):
         ).encode("utf-8")
         for index in range(1000)
     ]
-    raw = b"".join([first_line, *filler_lines])
+    raw = b"".join([*first_lines, *filler_lines])
     source.write_bytes(raw)
     records, raw_lines, errors = session_cleanup.parse_jsonl(source)
     assert errors == []
-    rendered_text = "[session cleanup capsule]\nretained: old output"
-    operation = {
-        "block_id": "b-1",
-        "line": 1,
-        "record_index": 0,
-        "call_id": "call-1",
-        "json_pointer": "/payload/output",
-        "source_node_sha256": session_cleanup.hash_json_node(record["payload"]["output"]),
-        "rendered_text": rendered_text,
-    }
+    operations = []
+    blocks = []
+    for index, record in enumerate(first_records):
+        line = index + 1
+        rendered_text = (
+            "[session cleanup capsule]\nretained: old output"
+            if index == 0
+            else f"[session cleanup capsule]\nretained: old output {index + 1}"
+        )
+        blocks.append({"block_id": f"b-{index + 1}", "source_lines": [line, line], "role": "context"})
+        operations.append(
+            {
+                "block_id": f"b-{index + 1}",
+                "line": line,
+                "record_index": index,
+                "call_id": record["payload"]["call_id"],
+                "json_pointer": "/payload/output",
+                "source_node_sha256": session_cleanup.hash_json_node(record["payload"]["output"]),
+                "rendered_text": rendered_text,
+            }
+        )
+    sidecar = {"capsule_id": "capsule-1"}
+    if operation_count == 1:
+        sidecar["rendered_text"] = operations[0]["rendered_text"]
     bundle = {
         "semantic_map_version": 1,
         "source": {"sha256": sha256_file(source), "bytes": len(raw)},
-        "blocks": [{"block_id": "b-1", "source_lines": [1, 1], "role": "context"}],
-        "operations": [operation],
-        "sidecar": {"capsule_id": "capsule-1", "rendered_text": rendered_text},
+        "blocks": blocks,
+        "operations": operations,
+        "sidecar": sidecar,
         "semantic_review": {
             "planner": {"artifact": "planner-review-1", "status": "pass"},
             "critic": {"artifact": "critic-review-1", "status": "pass"},
@@ -448,6 +473,86 @@ class SessionCleanupTests(unittest.TestCase):
             self.assertIn(plan["status"], {"no_change", "blocked"})
             self.assertEqual(plan["summary"]["changed_records"], 0)
 
+    def test_semantic_plan_preserves_visible_user_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root)
+            source_lines = fixture["source"].read_bytes().splitlines(keepends=True)
+            visible_line = (
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "data:image/png;base64:" + "C" * 128,
+                                }
+                            ],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            fixture["source"].write_bytes(source_lines[0] + visible_line + b"".join(source_lines[1:]))
+
+            bundle = copy.deepcopy(fixture["bundle"])
+            bundle["source"] = {
+                "sha256": sha256_file(fixture["source"]),
+                "bytes": fixture["source"].stat().st_size,
+            }
+            fixture["bundle_path"].write_text(json.dumps(bundle), encoding="utf-8")
+            plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "reports", fixture["bundle_path"], 1000, 2
+            )
+
+            self.assertEqual(plan["status"], "ready_for_review")
+            self.assertEqual(plan["summary"]["changed_records"], 1)
+            candidate_lines = Path(plan["candidate_path"]).read_bytes().splitlines(keepends=True)
+            self.assertEqual(candidate_lines[1], visible_line)
+            self.assertEqual(session_cleanup.audit_plan(Path(plan["report_path"]))["status"], "pass")
+
+    def test_semantic_plan_audits_multiple_operations_in_source_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_fixture(root, operation_count=2)
+            plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "reports", fixture["bundle_path"], 1000, 2
+            )
+
+            self.assertEqual(plan["status"], "ready_for_review")
+            self.assertEqual(plan["summary"]["changed_records"], 2)
+            self.assertEqual([item["line"] for item in plan["transformation"]["changed_lines"]], [1, 2])
+            audit = session_cleanup.audit_plan(Path(plan["report_path"]))
+            self.assertEqual(audit["status"], "pass")
+
+    def test_semantic_apply_rejects_wrong_confirmation_and_no_change_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = _semantic_plan_fixture(root)
+            self.assertEqual(session_cleanup.audit_plan(fixture["plan_path"])["status"], "pass")
+
+            with self.assertRaisesRegex(ValueError, "confirmation must exactly equal plan_id"):
+                session_cleanup.apply_plan(fixture["plan_path"], "not-the-plan-id", fixture["backup_root"])
+
+            no_change_bundle = copy.deepcopy(fixture["bundle"])
+            no_change_bundle["operations"] = []
+            no_change_path = root / "no-change-bundle.json"
+            no_change_path.write_text(json.dumps(no_change_bundle), encoding="utf-8")
+            no_change_plan = session_cleanup.build_semantic_plan(
+                fixture["source"], root / "no-change-reports", no_change_path, 1000, 2
+            )
+            self.assertEqual(no_change_plan["status"], "no_change")
+            with self.assertRaisesRegex(ValueError, "semantic plan is not ready for review"):
+                session_cleanup.apply_plan(
+                    Path(no_change_plan["report_path"]),
+                    no_change_plan["plan_id"],
+                    fixture["backup_root"],
+                )
+
     def test_semantic_plan_cli_route_returns_reviewable_plan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -581,6 +686,34 @@ class SessionCleanupTests(unittest.TestCase):
         self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["max_output_bytes"], 16 * 1024)
         self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["prefix_bytes"], 2 * 1024)
         self.assertEqual(session_cleanup.PROFILE_POLICIES["space"]["suffix_bytes"], 1 * 1024)
+
+    def test_public_skill_documents_semantic_workflow(self):
+        root = Path(__file__).resolve().parents[1]
+        skill_text = (root / "SKILL.md").read_text(encoding="utf-8")
+        readme_text = (root / "README.md").read_text(encoding="utf-8")
+        schema_text = (root / "references" / "jsonl-schema.md").read_text(encoding="utf-8")
+
+        for phrase in (
+            "semantic bundle",
+            "semantic-plan",
+            "independent critic",
+            "Understand",
+            "Group",
+            "Compare",
+            "Confirm",
+            "exact `plan_id`",
+        ):
+            self.assertIn(phrase, skill_text)
+        for phrase in (
+            "semantic-plan",
+            "semantic_cleanup",
+            "audit_version: 3",
+            "sidecar",
+            "legacy",
+        ):
+            self.assertIn(phrase, readme_text)
+        for phrase in ("backup_verified", "sidecar_staged", "needs_manual_recovery"):
+            self.assertIn(phrase, schema_text)
 
     def test_named_profile_rejects_manual_thresholds(self):
         with self.assertRaises(ValueError):
